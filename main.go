@@ -717,7 +717,12 @@ func main() {
 	for t := 1; t <= Ttest; t++ {
 		r := Rtest[t-1]
 		w := meta.Step(r, t) // pre-sharpening: amplify differences before softmax
-		gamma := 3.0         // try 2–6
+
+		// bias weights using recent returns
+		for i := range w {
+			w[i] *= math.Exp(2.0 * r[i])
+		}
+		gamma := 3.0
 		for i := range w {
 			w[i] = math.Pow(w[i], gamma)
 		}
@@ -739,8 +744,42 @@ func main() {
 			// use last month's weights
 			w = wPrev
 		} else {
+			// select top-K stocks before softmax
+			K := 3
+
+			type pair struct {
+				idx int
+				val float64
+			}
+
+			pairs := make([]pair, len(w))
+			for i := range w {
+				pairs[i] = pair{i, w[i]}
+			}
+
+			sort.Slice(pairs, func(i, j int) bool {
+				return pairs[i].val > pairs[j].val
+			})
+
+			// zero out everything except top-K
+			wK := make([]float64, len(w))
+			for i := 0; i < K; i++ {
+				wK[pairs[i].idx] = pairs[i].val
+			}
+
+			// renormalize
+			sum := 0.0
+			for _, v := range wK {
+				sum += v
+			}
+			for i := range wK {
+				wK[i] /= sum
+			}
+
+			// now apply softmax to wK
+			w = wK
 			// softmax sharpening
-			alpha := 4.0 // try 2, 4, 8 for more concentration
+			alpha := 6.0 // try 2, 4, 8 for more concentration
 			maxW := w[0]
 			for _, v := range w {
 				if v > maxW {
