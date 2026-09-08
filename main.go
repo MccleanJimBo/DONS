@@ -680,7 +680,6 @@ func main() {
 			datesTest = append(datesTest, dt)
 		}
 	}
-
 	d := len(universe.Tickers)
 	Ttest := len(Rtest)
 
@@ -729,6 +728,7 @@ func main() {
 		w = projectSimplex(w)
 		// monthly rebalance: only update weights on the first trading day of each month
 		rebalance := false
+
 		if t == 1 {
 			rebalance = true
 		} else {
@@ -738,13 +738,10 @@ func main() {
 				rebalance = true
 			}
 		}
-
-		// keep previous weights for non-rebalance days
 		if !rebalance {
-			// use last month's weights
 			w = wPrev
 		} else {
-			// select top-K stocks before softmax
+			// --- TOP-K SELECTION ---
 			K := 3
 
 			type pair struct {
@@ -761,49 +758,56 @@ func main() {
 				return pairs[i].val > pairs[j].val
 			})
 
-			// zero out everything except top-K
-			wK := make([]float64, len(w))
+			// extract top-K
+			topIdx := make([]int, K)
+			topVals := make([]float64, K)
 			for i := 0; i < K; i++ {
-				wK[pairs[i].idx] = pairs[i].val
+				topIdx[i] = pairs[i].idx
+				topVals[i] = pairs[i].val
 			}
 
-			// renormalize
-			sum := 0.0
-			for _, v := range wK {
-				sum += v
+			// renormalize top-K
+			sumTop := 0.0
+			for _, v := range topVals {
+				sumTop += v
 			}
-			for i := range wK {
-				wK[i] /= sum
+			for i := range topVals {
+				topVals[i] /= sumTop
 			}
 
-			// now apply softmax to wK
-			w = wK
-			// softmax sharpening
-			alpha := 6.0 // try 2, 4, 8 for more concentration
-			maxW := w[0]
-			for _, v := range w {
-				if v > maxW {
-					maxW = v
+			// --- SOFTMAX ONLY ON TOP-K ---
+			alpha := 6.0
+			maxV := topVals[0]
+			for _, v := range topVals {
+				if v > maxV {
+					maxV = v
 				}
 			}
 
-			// numerically stable softmax
-			expW := make([]float64, len(w))
+			expVals := make([]float64, K)
 			sumExp := 0.0
-			for i := range w {
-				expW[i] = math.Exp(alpha * (w[i] - maxW))
-				sumExp += expW[i]
+			for i := range topVals {
+				expVals[i] = math.Exp(alpha * (topVals[i] - maxV))
+				sumExp += expVals[i]
 			}
 
+			// --- EXPAND BACK TO FULL VECTOR ---
 			wSharp := make([]float64, len(w))
-			for i := range w {
-				wSharp[i] = expW[i] / sumExp
+			for i := 0; i < K; i++ {
+				wSharp[topIdx[i]] = expVals[i] / sumExp
 			}
 
-			// store for next days
+			// all other weights = 0
+			for i := range wSharp {
+				if wSharp[i] < 1e-15 {
+					wSharp[i] = 0.0
+				}
+			}
+
 			wPrev = wSharp
 			w = wSharp
 		}
+
 		for i := range w {
 			if !isFinite(w[i]) {
 				w[i] = 0.0
@@ -880,7 +884,11 @@ func main() {
 			row = append(row, fmt.Sprintf("%.6f", weight))
 		}
 
-		weightRecords = append(weightRecords, row)
+		// rebalance logic here
+		if rebalance {
+			weightRecords = append(weightRecords, row)
+		}
+
 	}
 
 	rrSPY := rollingRegret(lossAlgo, lossSPY, 60)
