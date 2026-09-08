@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"gonum.org/v1/gonum/mat"
@@ -166,6 +167,7 @@ func sub(a, b []float64) []float64 {
 // ─────────────────────────────────────────────
 // Simplex projection
 // ─────────────────────────────────────────────
+
 func projectSimplex(v []float64) []float64 {
 	n := len(v)
 	u := make([]float64, n)
@@ -303,10 +305,11 @@ func (m *MetaDONS) Step(r []float64, t int) []float64 {
 	for i, e := range active {
 		w = add(w, scale(portfolios[i], e.weight))
 	}
-	w = topK(w, 3)
-	return projectSimplex(w)
+	wSparse := topK(w, 3)
+	return wSparse
 }
 func topK(w []float64, K int) []float64 {
+	// Top‑K filtering
 	type pair struct {
 		idx int
 		val float64
@@ -315,16 +318,29 @@ func topK(w []float64, K int) []float64 {
 	for i := range w {
 		arr[i] = pair{i, w[i]}
 	}
-
 	sort.Slice(arr, func(i, j int) bool {
 		return arr[i].val > arr[j].val
 	})
 
-	out := make([]float64, len(w))
+	// Keep only top K
+	wSparse := make([]float64, len(w))
 	for i := 0; i < K; i++ {
-		out[arr[i].idx] = arr[i].val
+		wSparse[arr[i].idx] = arr[i].val
 	}
-	return out
+
+	// Normalize ONLY top‑K entries
+	sumTop := 0.0
+	for _, v := range wSparse {
+		sumTop += v
+	}
+	for i := range wSparse {
+		if wSparse[i] > 0 {
+			wSparse[i] /= sumTop
+		}
+	}
+
+	return wSparse
+
 }
 
 // ─────────────────────────────────────────────
@@ -769,21 +785,32 @@ func runTest(
 				row = append(row, fmt.Sprintf("%.6f", weight))
 			}
 			weightRecords = append(weightRecords, row)
+			tickersOut := []string{}
+			entriesOut := []string{}
+			exitsOut := []string{}
+			weightsOut := []string{}
 			for j := 0; j < d; j++ {
 				if w[j] <= 1e-12 {
 					continue
 				}
 				currPrice := allPrices[tickers[j]][t].Prices[0]
-				trades = append(trades, []string{
-					fmt.Sprintf("%d", t),
-					datesTest[t].Format("2006-01-02"),
-					tickers[j],
-					fmt.Sprintf("%.4f", prevPrices[j]),
-					fmt.Sprintf("%.4f", currPrice),
-					fmt.Sprintf("%.6f", w[j]),
-				})
+				tickersOut = append(tickersOut, tickers[j])
+				entriesOut = append(entriesOut, fmt.Sprintf("%.4f", prevPrices[j]))
+				exitsOut = append(exitsOut, fmt.Sprintf("%.4f", allPrices[tickers[j]][t].Prices[0]))
+				weightsOut = append(weightsOut, fmt.Sprintf("%.6f", w[j]))
+
 				prevPrices[j] = currPrice
 			}
+			// ONE LINE PER REBALANCE
+			trades = append(trades, []string{
+				fmt.Sprintf("%d", t),
+				datesTest[t].Format("2006-01-02"),
+				strings.Join(tickersOut, " "),
+
+				strings.Join(entriesOut, " "),
+				strings.Join(exitsOut, " "),
+				strings.Join(weightsOut, " "),
+			})
 
 		}
 		iter++
@@ -803,6 +830,14 @@ func runTest(
 		if retBest <= 0 || math.IsNaN(retBest) || math.IsInf(retBest, 0) {
 			retBest = 1.0
 		}
+		records = append(records, []string{
+			fmt.Sprintf("%d", t),
+			datesTest[t].Format("2006-01-02"),
+			fmt.Sprintf("%.6f", retAlgo),
+			fmt.Sprintf("%.6f", retSPY),
+			fmt.Sprintf("%.6f", retBest),
+		})
+
 		algoWealth[t] = algoWealth[t-1] * retAlgo
 		spyWealth[t] = spyWealth[t-1] * retSPY
 		bestWealth[t] = bestWealth[t-1] * retBest
@@ -937,6 +972,11 @@ func main() {
 	if err := writeCSV("analysis/trades.csv", trades); err != nil {
 		log.Fatalf("CSV error: %v", err)
 	}
-
+	if err := plotSeries("analysis/strategy.png", algoWealth, "Strategy"); err != nil {
+		fmt.Println("plotSeries error:", err)
+	}
+	if err := plotSeries("analysis/spy.png", spyWealth, "SPY"); err != nil {
+		fmt.Println("plotSeries error:", err)
+	}
 	fmt.Println("Backtest complete.")
 }
