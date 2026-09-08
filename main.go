@@ -27,141 +27,46 @@ const (
 // ─────────────────────────────────────────────
 // Expert struct
 // ─────────────────────────────────────────────
-
 type Expert struct {
-	start  int     // when this expert begins
-	dons   *DONS   // its own DONS instance
-	weight float64 // meta-weight
+	dons   *DONS
+	start  int
+	weight float64
+	T      int
 }
-
-// ─────────────────────────────────────────────
-// Meta‑DONS struct
-// ─────────────────────────────────────────────
 
 type MetaDONS struct {
 	d       int
 	T       int
-	n       float64
-	beta    float64
 	eta     float64
 	experts []*Expert
 }
 
 // ─────────────────────────────────────────────
-// Constructor
+// DONS struct
 // ─────────────────────────────────────────────
+type DONS struct {
+	d         int
+	n         float64
+	beta      float64
+	w         [][]float64 // weight history
+	p         []float64   // barrier parameter vector
+	G         []float64   // gradient accumulator
+	gsHistory [][]float64 // gradient history
+	wsHistory [][]float64 // weight history for quadratic term
+}
 
-func NewMetaDONS(d, T int, n, beta, eta float64) *MetaDONS {
+func NewMetaDONS(d, T int, eta float64) *MetaDONS {
 	return &MetaDONS{
 		d:       d,
 		T:       T,
-		n:       n,
-		beta:    beta,
 		eta:     eta,
 		experts: []*Expert{},
 	}
 }
 
 // ─────────────────────────────────────────────
-// Geometric start times: 1,2,4,8,16,...
-// ─────────────────────────────────────────────
-
-func geometricStarts(t int) []int {
-	var starts []int
-	k := 1
-	for k <= t {
-		starts = append(starts, k)
-		k *= 2
-	}
-	return starts
-}
-
-// ─────────────────────────────────────────────
-// Ensure experts exist for this time t
-// ─────────────────────────────────────────────
-
-func (m *MetaDONS) ensureExperts(t int) {
-	needed := geometricStarts(t)
-
-	existing := make(map[int]bool)
-	for _, e := range m.experts {
-		existing[e.start] = true
-	}
-
-	for _, s := range needed {
-		if !existing[s] {
-			m.experts = append(m.experts, &Expert{
-				start:  s,
-				dons:   NewDONS(m.d, m.n, m.beta),
-				weight: 1.0,
-			})
-		}
-	}
-}
-
-// ─────────────────────────────────────────────
-// Meta‑DONS Step
-// ─────────────────────────────────────────────
-
-func (m *MetaDONS) Step(r []float64, t int) []float64 {
-	m.ensureExperts(t)
-
-	// Active experts = those whose start <= t
-	active := []*Expert{}
-	for _, e := range m.experts {
-		if e.start <= t {
-			active = append(active, e)
-		}
-	}
-
-	portfolios := make([][]float64, len(active))
-	losses := make([]float64, len(active))
-
-	// Each expert runs its own DONS step
-	for i, e := range active {
-		u := e.dons.Step(r, t, m.T)
-		portfolios[i] = u
-		losses[i] = -math.Log(dot(r, u))
-	}
-
-	// Update expert weights (exponential weights)
-	var Z float64
-	for i, e := range active {
-		e.weight *= math.Exp(-m.eta * losses[i])
-		Z += e.weight
-	}
-	for _, e := range active {
-		e.weight /= Z
-	}
-
-	// Mixture portfolio
-	w := make([]float64, m.d)
-	for i, e := range active {
-		w = add(w, scale(portfolios[i], e.weight))
-	}
-
-	return projectSimplex(w)
-}
-
-// ─────────────────────────────────────────────
-// DONS struct
-// ─────────────────────────────────────────────
-
-type DONS struct {
-	d         int
-	n         float64
-	beta      float64
-	w         [][]float64
-	p         []float64
-	G         []float64
-	gsHistory [][]float64
-	wsHistory [][]float64
-}
-
-// ─────────────────────────────────────────────
 // Constructor
 // ─────────────────────────────────────────────
-
 func NewDONS(d int, n, beta float64) *DONS {
 	w1 := make([]float64, d)
 	for i := range w1 {
@@ -184,6 +89,51 @@ func NewDONS(d int, n, beta float64) *DONS {
 		wsHistory: [][]float64{},
 	}
 }
+
+func (m *MetaDONS) ensureExperts(t int) {
+	if len(m.experts) == 0 {
+		// first expert at t=0
+		e := &Expert{
+			dons:   NewDONS(m.d, NStock, BetaStock),
+			start:  t,
+			weight: 1.0,
+			T:      m.T,
+		}
+		m.experts = append(m.experts, e)
+		return
+	}
+
+	// geometric schedule based on number of experts
+	if len(m.experts) < 20 { // cap to avoid explosion
+		if t == 1<<len(m.experts) {
+			e := &Expert{
+				dons:   NewDONS(m.d, NStock, BetaStock),
+				start:  t,
+				weight: 1.0,
+				T:      m.T,
+			}
+			m.experts = append(m.experts, e)
+		}
+	}
+}
+
+// ─────────────────────────────────────────────
+// Geometric start times: 1,2,4,8,16,...
+// ─────────────────────────────────────────────
+
+func geometricStarts(t int) []int {
+	var starts []int
+	k := 1
+	for k <= t {
+		starts = append(starts, k)
+		k *= 2
+	}
+	return starts
+}
+
+// ─────────────────────────────────────────────
+// Constructor
+// ─────────────────────────────────────────────
 
 // ─────────────────────────────────────────────
 // Utility functions
@@ -216,35 +166,37 @@ func sub(a, b []float64) []float64 {
 // ─────────────────────────────────────────────
 // Simplex projection
 // ─────────────────────────────────────────────
-
-func projectSimplex(x []float64) []float64 {
-	n := len(x)
+func projectSimplex(v []float64) []float64 {
+	n := len(v)
 	u := make([]float64, n)
-	copy(u, x)
+	copy(u, v)
 
+	// sort descending
 	sort.Slice(u, func(i, j int) bool { return u[i] > u[j] })
 
+	// find rho
+	var rho int
 	var sum float64
-	rho := -1
 	for i := 0; i < n; i++ {
 		sum += u[i]
-		t := (sum - 1.0) / float64(i+1)
-		if u[i] > t {
+		if u[i]+(1.0-sum)/float64(i+1) > 0 {
 			rho = i
 		}
 	}
 
+	// compute theta
 	sum = 0
 	for i := 0; i <= rho; i++ {
 		sum += u[i]
 	}
 	theta := (sum - 1.0) / float64(rho+1)
 
-	y := make([]float64, n)
+	// project
+	w := make([]float64, n)
 	for i := 0; i < n; i++ {
-		y[i] = math.Max(x[i]-theta, 0.0)
+		w[i] = math.Max(v[i]-theta, 0)
 	}
-	return y
+	return w
 }
 
 // ─────────────────────────────────────────────
@@ -312,10 +264,72 @@ func quadraticHessian(gsHistory [][]float64, beta float64, d int) [][]float64 {
 	return H
 }
 
+func (m *MetaDONS) Step(r []float64, t int) []float64 {
+	m.ensureExperts(t)
+
+	active := []*Expert{}
+	for _, e := range m.experts {
+		if e.start <= t {
+			active = append(active, e)
+		}
+	}
+
+	portfolios := make([][]float64, len(active))
+	losses := make([]float64, len(active))
+
+	for i, e := range active {
+		uRaw := e.dons.Step(r, t, m.T)
+		u := projectSimplex(uRaw)
+		portfolios[i] = u
+
+		val := dot(r, u)
+		if val <= 0 {
+			losses[i] = 1000
+		} else {
+			losses[i] = -math.Log(val)
+		}
+	}
+
+	var Z float64
+	for i, e := range active {
+		e.weight *= math.Exp(-m.eta * losses[i])
+		Z += e.weight
+	}
+	for _, e := range active {
+		e.weight /= Z
+	}
+
+	w := make([]float64, m.d)
+	for i, e := range active {
+		w = add(w, scale(portfolios[i], e.weight))
+	}
+	w = topK(w, 3)
+	return projectSimplex(w)
+}
+func topK(w []float64, K int) []float64 {
+	type pair struct {
+		idx int
+		val float64
+	}
+	arr := make([]pair, len(w))
+	for i := range w {
+		arr[i] = pair{i, w[i]}
+	}
+
+	sort.Slice(arr, func(i, j int) bool {
+		return arr[i].val > arr[j].val
+	})
+
+	out := make([]float64, len(w))
+	for i := 0; i < K; i++ {
+		out[arr[i].idx] = arr[i].val
+	}
+	return out
+}
+
 // ─────────────────────────────────────────────
 // DONS Step
 // ─────────────────────────────────────────────
-
 func (d *DONS) Step(r []float64, t, T int) []float64 {
 	wt := d.w[len(d.w)-1]
 
@@ -323,7 +337,17 @@ func (d *DONS) Step(r []float64, t, T int) []float64 {
 	for i := range u {
 		u[i] = (1.0-1.0/float64(T))*wt[i] + 1.0/(float64(d.d)*float64(T))
 	}
+	// MOMENTUM BIAS
+	momentum := 0.10
+	if len(d.wsHistory) > 0 {
+		// PREVIOUS WEIGHT
+		wtPrev := d.wsHistory[len(d.wsHistory)-1]
 
+		for i := range u {
+			u[i] += momentum * (wt[i] - wtPrev[i])
+		}
+	}
+	u = projectSimplex(u)
 	g := coverGradient(r, u)
 
 	d.gsHistory = append(d.gsHistory, g)
@@ -339,7 +363,7 @@ func (d *DONS) Step(r []float64, t, T int) []float64 {
 	Qhess := quadraticHessian(d.gsHistory, d.beta, d.d)
 
 	totalGrad := add(Vgrad, Qgrad)
-	// newtonDir MUST be declared before the inverse attempt
+
 	newtonDir := make([]float64, d.d)
 	H := mat.NewDense(d.d, d.d, nil)
 	for i := 0; i < d.d; i++ {
@@ -355,27 +379,21 @@ func (d *DONS) Step(r []float64, t, T int) []float64 {
 
 	gradVec := mat.NewVecDense(d.d, totalGrad)
 
-	// try Newton; if it fails, fall back to gradient step
 	var Hinv mat.Dense
 	if err := Hinv.Inverse(H); err == nil {
 		HinvGrad := mat.NewVecDense(d.d, nil)
 		HinvGrad.MulVec(&Hinv, gradVec)
+		for i := 0; i < d.d; i++ {
+			newtonDir[i] = HinvGrad.AtVec(i)
+		}
 	} else {
-		// fallback: simple gradient direction
 		for i := 0; i < d.d; i++ {
 			newtonDir[i] = totalGrad[i]
 		}
 	}
-
-	HinvGrad := mat.NewVecDense(d.d, nil)
-	HinvGrad.MulVec(&Hinv, gradVec)
-
-	for i := 0; i < d.d; i++ {
-		newtonDir[i] = HinvGrad.AtVec(i)
-	}
-
+	gamma := 3.0
 	den := 1.0 + 4.0*math.Sqrt(dot(totalGrad, newtonDir))
-	step := scale(newtonDir, 1.0/den)
+	step := scale(newtonDir, gamma/den)
 
 	wNext := make([]float64, d.d)
 	for i := range wNext {
@@ -383,7 +401,7 @@ func (d *DONS) Step(r []float64, t, T int) []float64 {
 	}
 
 	wNext = projectSimplex(wNext)
-	// sanity check: no NaN, no Inf
+
 	bad := false
 	for i := range wNext {
 		if math.IsNaN(wNext[i]) || math.IsInf(wNext[i], 0) {
@@ -393,7 +411,6 @@ func (d *DONS) Step(r []float64, t, T int) []float64 {
 	}
 
 	if bad {
-		// fallback: keep previous weights or go to uniform
 		wNext = make([]float64, d.d)
 		for i := range wNext {
 			wNext[i] = 1.0 / float64(d.d)
@@ -401,8 +418,8 @@ func (d *DONS) Step(r []float64, t, T int) []float64 {
 	}
 
 	d.w = append(d.w, wNext)
+	return projectSimplex(wNext)
 
-	return u
 }
 
 // ─────────────────────────────────────────────
@@ -530,11 +547,12 @@ func plotSeries(filename string, series []float64, title string) error {
 	return p.Save(8*vg.Inch, 4*vg.Inch, filename)
 }
 
-// BuildReturnMatrix: prices -> aligned returns
-func BuildReturnMatrix(all map[string][]data.DailyPrices, universe data.Universe) ([][]float64, []time.Time, error) {
+// BuildReturnMatrix: prices -> aligned multiplicative returns
+func BuildReturnMatrix(all map[string][]data.PricesStruct, universe data.Universe) ([][]float64, []time.Time, error) {
 	tickers := universe.Tickers
 	d := len(tickers)
 
+	// Collect all dates
 	dateMap := make(map[time.Time]bool)
 	for _, prices := range all {
 		for _, dp := range prices {
@@ -548,6 +566,7 @@ func BuildReturnMatrix(all map[string][]data.DailyPrices, universe data.Universe
 	}
 	sort.Slice(dates, func(i, j int) bool { return dates[i].Before(dates[j]) })
 
+	// Build price matrix
 	priceMatrix := make([][]float64, len(dates))
 	for i := range priceMatrix {
 		priceMatrix[i] = make([]float64, d)
@@ -569,6 +588,7 @@ func BuildReturnMatrix(all map[string][]data.DailyPrices, universe data.Universe
 		}
 	}
 
+	// Forward-fill missing prices
 	for j := 0; j < d; j++ {
 		var last float64
 		haveLast := false
@@ -582,11 +602,38 @@ func BuildReturnMatrix(all map[string][]data.DailyPrices, universe data.Universe
 		}
 	}
 
+	// Multiplicative returns
 	R := make([][]float64, len(dates)-1)
 	for t := 1; t < len(dates); t++ {
 		R[t-1] = make([]float64, d)
 		for j := 0; j < d; j++ {
-			R[t-1][j] = priceMatrix[t][j] / priceMatrix[t-1][j]
+
+			p0 := priceMatrix[t-1][j]
+			p1 := priceMatrix[t][j]
+
+			// invalid prices → neutral multiplier
+			if p0 <= 0 || p1 <= 0 || math.IsNaN(p0) || math.IsNaN(p1) {
+				R[t-1][j] = 1.0
+				continue
+			}
+
+			r := p1 / p0
+
+			// sanitize only NaN/Inf
+			if math.IsNaN(r) || math.IsInf(r, 0) {
+				R[t-1][j] = 1.0
+				continue
+			}
+
+			// IMPORTANT: clamp extreme values
+			if r < 0.5 {
+				r = 0.5
+			}
+			if r > 1.5 {
+				r = 1.5
+			}
+
+			R[t-1][j] = r
 		}
 	}
 
@@ -640,32 +687,191 @@ func cleanSeries(xs []float64) []float64 {
 	}
 	return out
 }
+func isMonthBoundary(prev, curr time.Time) bool {
+	return prev.Month() != curr.Month()
+}
+
 func isFinite(x float64) bool {
 	return !math.IsNaN(x) && !math.IsInf(x, 0)
 }
+func sum(w []float64) float64 {
+	s := 0.0
+	for _, x := range w {
+		s += x
+	}
+	return s
+}
+
+func max(w []float64) float64 {
+	m := w[0]
+	for _, x := range w {
+		if x > m {
+			m = x
+		}
+	}
+	return m
+}
+
+func runTest(
+	Rtest [][]float64,
+	datesTest []time.Time,
+	tickers []string,
+	allPrices map[string][]data.PricesStruct,
+	uSPY []float64,
+	uBest []float64,
+	meta *MetaDONS,
+) (
+	[]float64,
+	[]float64,
+	[]float64,
+	[][]string,
+	[][]string,
+	[][]string,
+) {
+	T := len(Rtest)
+	d := len(tickers)
+
+	algoWealth := make([]float64, T)
+	spyWealth := make([]float64, T)
+	bestWealth := make([]float64, T)
+
+	algoWealth[0] = 1.0
+	spyWealth[0] = 1.0
+	bestWealth[0] = 1.0
+
+	records := [][]string{{"t", "date", "ret_algo", "ret_spy", "ret_best", "wealth_algo", "wealth_spy", "wealth_best"}}
+
+	weightRecords := [][]string{}
+	header := append([]string{"t", "date"}, tickers...)
+	weightRecords = append(weightRecords, header)
+
+	trades := [][]string{{"t", "date", "ticker", "entry", "exit", "weight"}}
+
+	prevPrices := make([]float64, d)
+	for j := 0; j < d; j++ {
+		prevPrices[j] = allPrices[tickers[j]][0].Prices[0]
+	}
+
+	w := make([]float64, d)
+	iter := 0
+
+	for t := 1; t < T; t++ {
+		rToday := Rtest[t]
+
+		// DAILY expert update (DONS + MetaDONS)
+		w = meta.Step(rToday, iter)
+		if datesTest[t-1].Month() != datesTest[t].Month() {
+			row := []string{
+				fmt.Sprintf("%d", t),
+				datesTest[t].Format("2006-01-02"),
+			}
+			for _, weight := range w {
+				row = append(row, fmt.Sprintf("%.6f", weight))
+			}
+			weightRecords = append(weightRecords, row)
+			for j := 0; j < d; j++ {
+				if w[j] <= 1e-12 {
+					continue
+				}
+				currPrice := allPrices[tickers[j]][t].Prices[0]
+				trades = append(trades, []string{
+					fmt.Sprintf("%d", t),
+					datesTest[t].Format("2006-01-02"),
+					tickers[j],
+					fmt.Sprintf("%.4f", prevPrices[j]),
+					fmt.Sprintf("%.4f", currPrice),
+					fmt.Sprintf("%.6f", w[j]),
+				})
+				prevPrices[j] = currPrice
+			}
+
+		}
+		iter++
+
+		// DAILY COMPOUNDING
+		retAlgo := dotSafe(rToday, w)
+
+		retSPY := dotSafe(rToday, uSPY)
+		retBest := dotSafe(rToday, uBest)
+		// guard
+		if retAlgo <= 0 || math.IsNaN(retAlgo) || math.IsInf(retAlgo, 0) {
+			retAlgo = 1.0
+		}
+		if retSPY <= 0 || math.IsNaN(retSPY) || math.IsInf(retSPY, 0) {
+			retSPY = 1.0
+		}
+		if retBest <= 0 || math.IsNaN(retBest) || math.IsInf(retBest, 0) {
+			retBest = 1.0
+		}
+		algoWealth[t] = algoWealth[t-1] * retAlgo
+		spyWealth[t] = spyWealth[t-1] * retSPY
+		bestWealth[t] = bestWealth[t-1] * retBest
+		records = append(records, []string{
+			fmt.Sprintf("%d", t),
+			datesTest[t].Format("2006-01-02"),
+			fmt.Sprintf("%.6f", retAlgo),
+			fmt.Sprintf("%.6f", retSPY),
+			fmt.Sprintf("%.6f", retBest),
+			fmt.Sprintf("%.6f", algoWealth[t]),
+			fmt.Sprintf("%.6f", spyWealth[t]),
+			fmt.Sprintf("%.6f", bestWealth[t]),
+		})
+
+	}
+
+	return algoWealth, spyWealth, bestWealth, records, weightRecords, trades
+}
+func normalize(w []float64) {
+	sum := 0.0
+	for _, v := range w {
+		if v > 0 && !math.IsNaN(v) && !math.IsInf(v, 0) {
+			sum += v
+		}
+	}
+	if sum == 0 {
+		return
+	}
+	for i := range w {
+		if w[i] > 0 {
+			w[i] /= sum
+		} else {
+			w[i] = 0
+		}
+	}
+}
+
+func dotSafe(r, w []float64) float64 {
+	sum := 0.0
+	for i := range r {
+		if math.IsNaN(r[i]) || math.IsInf(r[i], 0) {
+			continue
+		}
+		sum += w[i] * r[i]
+	}
+	return sum
+}
+
 func main() {
 
+	// --- Load universe ---
 	universe, err := data.LoadUniverse()
 	if err != nil {
 		log.Fatalf("load universe: %v", err)
 	}
-	weightRecords := [][]string{}
-	header := []string{"t", "date"}
-	for _, ticker := range universe.Tickers {
-		header = append(header, ticker)
-	}
-	weightRecords = append(weightRecords, header)
 
+	// --- Load prices (daily OR weekly OR monthly depending on fetcher) ---
 	allPrices, err := data.LoadAllYahooPrices(universe)
 	if err != nil {
 		log.Fatalf("load prices: %v", err)
 	}
 
+	// --- Build generic return matrix ---
 	R, dates, err := BuildReturnMatrix(allPrices, universe)
 	if err != nil {
 		log.Fatalf("build returns: %v", err)
 	}
 
+	// --- Train/test split ---
 	trainEnd := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 
 	var Rtrain, Rtest [][]float64
@@ -680,250 +886,57 @@ func main() {
 			datesTest = append(datesTest, dt)
 		}
 	}
+
 	d := len(universe.Tickers)
 	Ttest := len(Rtest)
 
-	// tuned-ish params for stocks (refine via grid search)
-	n := 2.0
-	beta := 0.5
+	// --- MetaDONS parameters ---
+
 	eta := 0.15
 
-	meta := NewMetaDONS(d, Ttest, n, beta, eta)
+	meta := NewMetaDONS(d, Ttest, eta)
 
+	// --- Comparator vectors ---
 	uSPY := comparatorSPY(universe)
 	uBest := bestSingleAssetInHindsight(Rtest)
 
-	algoWealth := make([]float64, Ttest)
-	spyWealth := make([]float64, Ttest)
-	bestWealth := make([]float64, Ttest)
+	// --- Run the generic backtest engine ---
+	algoWealth, spyWealth, bestWealth,
+		records, weightRecords, trades :=
+		runTest(
+			Rtest,
+			datesTest,
+			universe.Tickers,
+			allPrices,
+			uSPY,
+			uBest,
+			meta,
+		)
 
-	lossAlgo := make([]float64, Ttest)
-	lossSPY := make([]float64, Ttest)
-	lossBest := make([]float64, Ttest)
+	// --- Print summary ---
+	log.Printf("Test period: %s to %s",
+		datesTest[0].Format("2006-01-02"),
+		datesTest[len(datesTest)-1].Format("2006-01-02"),
+	)
 
-	logRetAlgo := make([]float64, Ttest)
-	logRetSPY := make([]float64, Ttest)
+	log.Printf("Final wealth: Algo=%.4f, SPY=%.4f, BestSingle=%.4f",
+		algoWealth[len(algoWealth)-1],
+		spyWealth[len(spyWealth)-1],
+		bestWealth[len(bestWealth)-1],
+	)
 
-	wa, ws, wb := 1.0, 1.0, 1.0
-	var cumLossAlgo, cumLossSPY, cumLossBest float64
-
-	records := [][]string{{"t", "date", "loss_algo", "loss_spy", "loss_best", "regret_spy", "regret_best", "wealth_algo", "wealth_spy", "wealth_best"}}
-	// previous month's weights (initialized to uniform)
-	wPrev := make([]float64, len(universe.Tickers))
-	for i := range wPrev {
-		wPrev[i] = 1.0 / float64(len(wPrev))
-	}
-	for t := 1; t <= Ttest; t++ {
-		r := Rtest[t-1]
-		w := meta.Step(r, t) // pre-sharpening: amplify differences before softmax
-
-		// bias weights using recent returns
-		for i := range w {
-			w[i] *= math.Exp(2.0 * r[i])
-		}
-		gamma := 3.0
-		for i := range w {
-			w[i] = math.Pow(w[i], gamma)
-		}
-		w = projectSimplex(w)
-		// monthly rebalance: only update weights on the first trading day of each month
-		rebalance := false
-
-		if t == 1 {
-			rebalance = true
-		} else {
-			prev := datesTest[t-2]
-			curr := datesTest[t-1]
-			if prev.Month() != curr.Month() {
-				rebalance = true
-			}
-		}
-		if !rebalance {
-			w = wPrev
-		} else {
-			// --- TOP-K SELECTION ---
-			K := 3
-
-			type pair struct {
-				idx int
-				val float64
-			}
-
-			pairs := make([]pair, len(w))
-			for i := range w {
-				pairs[i] = pair{i, w[i]}
-			}
-
-			sort.Slice(pairs, func(i, j int) bool {
-				return pairs[i].val > pairs[j].val
-			})
-
-			// extract top-K
-			topIdx := make([]int, K)
-			topVals := make([]float64, K)
-			for i := 0; i < K; i++ {
-				topIdx[i] = pairs[i].idx
-				topVals[i] = pairs[i].val
-			}
-
-			// renormalize top-K
-			sumTop := 0.0
-			for _, v := range topVals {
-				sumTop += v
-			}
-			for i := range topVals {
-				topVals[i] /= sumTop
-			}
-
-			// --- SOFTMAX ONLY ON TOP-K ---
-			alpha := 6.0
-			maxV := topVals[0]
-			for _, v := range topVals {
-				if v > maxV {
-					maxV = v
-				}
-			}
-
-			expVals := make([]float64, K)
-			sumExp := 0.0
-			for i := range topVals {
-				expVals[i] = math.Exp(alpha * (topVals[i] - maxV))
-				sumExp += expVals[i]
-			}
-
-			// --- EXPAND BACK TO FULL VECTOR ---
-			wSharp := make([]float64, len(w))
-			for i := 0; i < K; i++ {
-				wSharp[topIdx[i]] = expVals[i] / sumExp
-			}
-
-			// all other weights = 0
-			for i := range wSharp {
-				if wSharp[i] < 1e-15 {
-					wSharp[i] = 0.0
-				}
-			}
-
-			wPrev = wSharp
-			w = wSharp
-		}
-
-		for i := range w {
-			if !isFinite(w[i]) {
-				w[i] = 0.0
-			}
-		}
-		retAlgo := dot(r, w)
-		if !isFinite(retAlgo) || retAlgo <= 0 {
-			// fallback: treat as no gain/loss
-			retAlgo = 1.0
-		}
-
-		retSPY := dot(r, uSPY)
-		if !isFinite(retSPY) || retSPY <= 0 {
-			retSPY = 1.0
-		}
-
-		retBest := dot(r, uBest)
-		if !isFinite(retBest) || retBest <= 0 {
-			retBest = 1.0
-		}
-
-		wa *= retAlgo
-		ws *= retSPY
-		wb *= retBest
-
-		algoWealth[t-1] = wa
-		spyWealth[t-1] = ws
-		bestWealth[t-1] = wb
-
-		la := -math.Log(retAlgo)
-		ls := -math.Log(retSPY)
-		lb := -math.Log(retBest)
-
-		lossAlgo[t-1] = la
-		lossSPY[t-1] = ls
-		lossBest[t-1] = lb
-
-		cumLossAlgo += la
-		cumLossSPY += ls
-		cumLossBest += lb
-
-		regretSPY := cumLossAlgo - cumLossSPY
-		regretBest := cumLossAlgo - cumLossBest
-
-		logRetAlgo[t-1] = math.Log(retAlgo)
-		logRetSPY[t-1] = math.Log(retSPY)
-		if !isFinite(logRetAlgo[t-1]) {
-			logRetAlgo[t-1] = 0.0
-		}
-		if !isFinite(logRetSPY[t-1]) {
-			logRetSPY[t-1] = 0.0
-		}
-		records = append(records, []string{
-			fmt.Sprintf("%d", t),
-			datesTest[t-1].Format("2006-01-02"),
-			fmt.Sprintf("%.6f", la),
-			fmt.Sprintf("%.6f", ls),
-			fmt.Sprintf("%.6f", lb),
-			fmt.Sprintf("%.6f", regretSPY),
-			fmt.Sprintf("%.6f", regretBest),
-			fmt.Sprintf("%.6f", wa),
-			fmt.Sprintf("%.6f", ws),
-			fmt.Sprintf("%.6f", wb),
-		})
-		row := []string{
-			fmt.Sprintf("%d", t),
-			datesTest[t-1].Format("2006-01-02"),
-		}
-
-		for _, weight := range w {
-			if !isFinite(weight) {
-				weight = 0.0
-			}
-			row = append(row, fmt.Sprintf("%.6f", weight))
-		}
-
-		// rebalance logic here
-		if rebalance {
-			weightRecords = append(weightRecords, row)
-		}
-
-	}
-
-	rrSPY := rollingRegret(lossAlgo, lossSPY, 60)
-
-	ddAlgo := maxDrawdown(algoWealth)
-	ddSPY := maxDrawdown(spyWealth)
-
-	shAlgo := sharpe(logRetAlgo)
-	shSPY := sharpe(logRetSPY)
-
-	volAlgo := volatility(logRetAlgo)
-	volSPY := volatility(logRetSPY)
-
-	log.Printf("Test period: %s to %s", datesTest[0].Format("2006-01-02"), datesTest[len(datesTest)-1].Format("2006-01-02"))
-	log.Printf("Final wealth: Algo=%.4f, SPY=%.4f, BestSingle=%.4f", wa, ws, wb)
-	log.Printf("Max drawdown: Algo=%.4f, SPY=%.4f", ddAlgo, ddSPY)
-	log.Printf("Sharpe: Algo=%.4f, SPY=%.4f", shAlgo, shSPY)
-	log.Printf("Volatility: Algo=%.4f, SPY=%.4f", volAlgo, volSPY)
-	if err := writeCSV("analysis/weights.csv", weightRecords); err != nil {
-		log.Fatalf("weights CSV error: %v", err)
-	}
-
-	if err := writeCSV("analysis/backtest_test_stock.csv", records); err != nil {
+	// --- Save CSV outputs ---
+	if err := writeCSV("analysis/backtest_test.csv", records); err != nil {
 		log.Fatalf("CSV error: %v", err)
 	}
-	if err := plotSeries("analysis/regret_spy_stock.png", rrSPY, "Rolling Regret vs SPY (60d)"); err != nil {
-		log.Fatalf("Plot error: %v", err)
-	}
-	if err := plotSeries("analysis/wealth_algo_stock.png", cleanSeries(algoWealth), "Algo Wealth (Stocks)"); err != nil {
-		log.Fatalf("Plot error: %v", err)
+
+	if err := writeCSV("analysis/weights.csv", weightRecords); err != nil {
+		log.Fatalf("CSV error: %v", err)
 	}
 
-	if err := plotSeries("analysis/wealth_spy_stock.png", cleanSeries(spyWealth), "SPY Wealth"); err != nil {
-		log.Fatalf("Plot error: %v", err)
+	if err := writeCSV("analysis/trades.csv", trades); err != nil {
+		log.Fatalf("CSV error: %v", err)
 	}
 
-	fmt.Println("Stock backtest complete. CSV: analysis/backtest_test_stock.csv")
+	fmt.Println("Backtest complete.")
 }

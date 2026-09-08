@@ -10,15 +10,14 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 
 	// time is required for Yahoo timestamp conversion and cache dates.
 	"time"
 )
 
-// DailyPrices holds raw daily close prices for one date.
-type DailyPrices struct {
+// PricesStruct holds raw periodic close prices for one date.
+type PricesStruct struct {
 	Date   time.Time
 	Prices []float64
 }
@@ -53,7 +52,7 @@ func LoadUniverse() (Universe, error) {
 			"LIN", "SHW", "ECL", "APD", "NEM",
 			"AMT", "PLD", "EQIX", "SPG", "WELL",
 			"NEE", "DUK", "SO", "AEP", "SRE",
-			"GOOGL", "META", "NFLX", "TMUS", "DIS",
+			"GOOGL", "META", "NFLX", "TMUS", "DIS", "tlt",
 		},
 	}, nil
 }
@@ -110,8 +109,8 @@ func toTimeSlice(slice []any) []time.Time {
 	return result
 }
 
-// ParseYahooCSV converts a Yahoo chart response into daily close prices.
-func ParseYahooCSV(response map[string]any) ([]DailyPrices, error) {
+// ParseYahooCSV converts a Yahoo chart response into periodic close prices.
+func ParseYahooCSV(response map[string]any) ([]PricesStruct, error) {
 	indicators := response["indicators"].(map[string]any)
 	quote := indicators["quote"].([]any)[0].(map[string]any)
 	closeValues := quote["close"].([]any)
@@ -136,14 +135,14 @@ func ParseYahooCSV(response map[string]any) ([]DailyPrices, error) {
 		raw = append(raw, rawPrice{date: time.Unix(int64(timestamps[i].(float64)), 0), value: closePrice})
 	}
 
-	out := make([]DailyPrices, 0, len(raw))
+	out := make([]PricesStruct, 0, len(raw))
 	pending := make([]time.Time, 0, 5)
 	var previous float64
 	hasPrevious := false
 	flushPending := func() {
 		if hasPrevious && len(pending) <= 5 {
 			for _, date := range pending {
-				out = append(out, DailyPrices{Date: date, Prices: []float64{previous}})
+				out = append(out, PricesStruct{Date: date, Prices: []float64{previous}})
 			}
 		}
 		pending = pending[:0]
@@ -158,7 +157,7 @@ func ParseYahooCSV(response map[string]any) ([]DailyPrices, error) {
 		flushPending()
 		previous = *point.value
 		hasPrevious = true
-		out = append(out, DailyPrices{Date: point.date, Prices: []float64{previous}})
+		out = append(out, PricesStruct{Date: point.date, Prices: []float64{previous}})
 	}
 	flushPending()
 	return out, nil
@@ -167,7 +166,7 @@ func cachedPricePath(ticker, stamp string) string {
 	return filepath.Join(priceCacheDirectory, fmt.Sprintf("%s_%s.csv", ticker, stamp))
 }
 
-func loadCachedPrices(path string) ([]DailyPrices, error) {
+func loadCachedPrices(path string) ([]PricesStruct, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -183,7 +182,7 @@ func loadCachedPrices(path string) ([]DailyPrices, error) {
 		return nil, fmt.Errorf("invalid cache header in %s", path)
 	}
 
-	prices := make([]DailyPrices, 0)
+	prices := make([]PricesStruct, 0)
 	for {
 		record, err := reader.Read()
 		if err == io.EOF {
@@ -203,7 +202,7 @@ func loadCachedPrices(path string) ([]DailyPrices, error) {
 		if err != nil || closePrice <= 0 || math.IsNaN(closePrice) || math.IsInf(closePrice, 0) {
 			return nil, fmt.Errorf("invalid cached close %q", record[1])
 		}
-		prices = append(prices, DailyPrices{Date: date, Prices: []float64{closePrice}})
+		prices = append(prices, PricesStruct{Date: date, Prices: []float64{closePrice}})
 	}
 	if len(prices) == 0 {
 		return nil, fmt.Errorf("cache file %s is empty", path)
@@ -211,7 +210,7 @@ func loadCachedPrices(path string) ([]DailyPrices, error) {
 	return prices, nil
 }
 
-func saveCachedPrices(path string, prices []DailyPrices) error {
+func saveCachedPrices(path string, prices []PricesStruct) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create cache directory: %w", err)
 	}
@@ -243,8 +242,8 @@ func saveCachedPrices(path string, prices []DailyPrices) error {
 	return nil
 }
 
-func LoadAllYahooPrices(universe Universe) (map[string][]DailyPrices, error) {
-	out := make(map[string][]DailyPrices)
+func LoadAllYahooPrices(universe Universe) (map[string][]PricesStruct, error) {
+	out := make(map[string][]PricesStruct)
 	start := time.Date(2016, time.January, 1, 0, 0, 0, 0, time.UTC) // fixed training start plus the 2024-present test period
 	end := time.Now()
 	stamp := fmt.Sprintf("2016-present-%s", time.Now().Format("2016-01-02"))
@@ -282,74 +281,4 @@ func LoadAllYahooPrices(universe Universe) (map[string][]DailyPrices, error) {
 	}
 
 	return out, nil
-}
-
-// Convert map[ticker][]DailyPrices → aligned return matrix [][]float64
-func BuildReturnMatrix(all map[string][]DailyPrices, universe Universe) ([][]float64, []time.Time, error) {
-	tickers := universe.Tickers
-	d := len(tickers)
-
-	// 1. Build date → index map
-	dateMap := make(map[time.Time]bool)
-	for _, prices := range all {
-		for _, dp := range prices {
-			dateMap[dp.Date] = true
-		}
-	}
-
-	// 2. Sort dates
-	dates := make([]time.Time, 0, len(dateMap))
-	for dt := range dateMap {
-		dates = append(dates, dt)
-	}
-	sort.Slice(dates, func(i, j int) bool { return dates[i].Before(dates[j]) })
-
-	// 3. Build price matrix: rows = dates, cols = tickers
-	priceMatrix := make([][]float64, len(dates))
-	for i := range priceMatrix {
-		priceMatrix[i] = make([]float64, d)
-		for j := range tickers {
-			priceMatrix[i][j] = math.NaN()
-		}
-	}
-
-	// Fill price matrix
-	for j, ticker := range tickers {
-		series := all[ticker]
-		idx := 0
-		for _, dp := range series {
-			// advance idx until dates[idx] == dp.Date
-			for idx < len(dates) && dates[idx].Before(dp.Date) {
-				idx++
-			}
-			if idx < len(dates) && dates[idx].Equal(dp.Date) {
-				priceMatrix[idx][j] = dp.Prices[0]
-			}
-		}
-	}
-
-	// 4. Forward-fill missing values (Yahoo sometimes skips holidays)
-	for j := 0; j < d; j++ {
-		var last float64
-		haveLast := false
-		for i := 0; i < len(dates); i++ {
-			if !math.IsNaN(priceMatrix[i][j]) {
-				last = priceMatrix[i][j]
-				haveLast = true
-			} else if haveLast {
-				priceMatrix[i][j] = last
-			}
-		}
-	}
-
-	// 5. Convert prices → returns
-	R := make([][]float64, len(dates)-1)
-	for t := 1; t < len(dates); t++ {
-		R[t-1] = make([]float64, d)
-		for j := 0; j < d; j++ {
-			R[t-1][j] = priceMatrix[t][j] / priceMatrix[t-1][j]
-		}
-	}
-
-	return R, dates[1:], nil
 }
