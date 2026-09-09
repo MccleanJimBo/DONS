@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -25,6 +26,53 @@ const (
 	BetaStock = 0.5  // quadratic regularization
 	EtaStock  = 0.15 // meta learning rate
 )
+
+type Config struct {
+	BarrierStrength float64
+	Beta            float64
+	Eta             float64
+	Gamma           float64
+	Momentum        float64
+	TopK            int
+	TransactionCost float64
+}
+
+func DefaultConfig() Config {
+	return Config{
+		BarrierStrength: NStock,
+		Beta:            BetaStock,
+		Eta:             EtaStock,
+		Gamma:           3.0,
+		Momentum:        0.0,
+		TopK:            0,
+		TransactionCost: 0.0,
+	}
+}
+
+func (c Config) Validate() error {
+	if c.BarrierStrength <= 0 || !isFinite(c.BarrierStrength) {
+		return errors.New("barrier strength must be finite and positive")
+	}
+	if c.Beta < 0 || !isFinite(c.Beta) {
+		return errors.New("beta must be finite and non-negative")
+	}
+	if c.Eta < 0 || !isFinite(c.Eta) {
+		return errors.New("eta must be finite and non-negative")
+	}
+	if c.Gamma <= 0 || !isFinite(c.Gamma) {
+		return errors.New("gamma must be finite and positive")
+	}
+	if c.Momentum < 0 || c.Momentum >= 1 || !isFinite(c.Momentum) {
+		return errors.New("momentum must be finite, at least 0, and less than 1")
+	}
+	if c.TopK < 0 {
+		return errors.New("top-k must be non-negative")
+	}
+	if c.TransactionCost < 0 || !isFinite(c.TransactionCost) {
+		return errors.New("transaction cost must be finite and non-negative")
+	}
+	return nil
+}
 
 // ─────────────────────────────────────────────
 // Expert struct
@@ -55,6 +103,7 @@ type MetaDONS struct {
 	eta      float64
 	gamma    float64
 	momentum float64
+	config   Config
 	experts  []*Expert
 	retired  int
 }
@@ -94,7 +143,9 @@ func (b *BarrierState) nt(T float64, n float64) []float64 {
 			nt[i] = n
 			continue
 		}
-		nt[i] = n * math.Exp(math.Log(factor)*math.Log(T+1))
+		logNt := math.Log(math.Max(n, 1e-300)) + math.Log(factor)*math.Log1p(T)
+		logNt = math.Min(logNt, math.Log(math.MaxFloat64))
+		nt[i] = math.Exp(logNt)
 	}
 	return nt
 }
@@ -115,18 +166,39 @@ type DONS struct {
 	pending                   []float64
 	lastNewtonDecrement       float64
 	lastKKTResidual           float64
+	lastRelativeKKTResidual   float64
 	lastConstraintResidual    float64
 	lastHessianRegularization float64
 	lastNewtonAccepted        bool
+	lastRawStepNorm           float64
+	lastAcceptedStepNorm      float64
+	lastStepSize              float64
+	lastBacktrackingAttempts  int
+	lastObjectiveBefore       float64
+	lastObjectiveAfter        float64
+	lastProjectionFallback    bool
+	lastMaxWeightChange       float64
+	lastGradientNorm          float64
+	lastProjectedGradientNorm float64
+	lastBarrierHessianNorm    float64
+	lastQuadraticHessianNorm  float64
+	lastCombinedHessianNorm   float64
 }
 
 func NewMetaDONS(d, T int, eta float64) *MetaDONS {
+	config := DefaultConfig()
+	config.Eta = eta
+	return NewMetaDONSWithConfig(d, T, config)
+}
+
+func NewMetaDONSWithConfig(d, T int, config Config) *MetaDONS {
 	return &MetaDONS{
 		d:        d,
 		T:        T,
-		eta:      eta,
-		gamma:    3.0,
-		momentum: 0.0,
+		eta:      config.Eta,
+		gamma:    config.Gamma,
+		momentum: config.Momentum,
+		config:   config,
 		experts:  []*Expert{},
 	}
 }
@@ -134,6 +206,8 @@ func NewMetaDONS(d, T int, eta float64) *MetaDONS {
 func (m *MetaDONS) SetDONSParameters(gamma, momentum float64) {
 	m.gamma = gamma
 	m.momentum = momentum
+	m.config.Gamma = gamma
+	m.config.Momentum = momentum
 }
 
 // ─────────────────────────────────────────────
@@ -173,7 +247,7 @@ func NewDONS(d int, n, beta float64) *DONS {
 func (m *MetaDONS) newExpert(start, end int) *Expert {
 	localHorizon := maxInt(1, end-start)
 	priorLogWeight := -math.Log(float64(localHorizon))
-	dons := NewDONS(m.d, NStock, BetaStock)
+	dons := NewDONS(m.d, m.config.BarrierStrength, m.config.Beta)
 	dons.gamma = m.gamma
 	dons.momentum = m.momentum
 	return &Expert{
@@ -322,6 +396,38 @@ func coverGradient(r, u []float64) []float64 {
 	return g
 }
 
+func checkedCoverGradient(r, u []float64) ([]float64, error) {
+	if len(r) == 0 || len(r) != len(u) {
+		return nil, errors.New("return and portfolio dimensions do not match")
+	}
+	for _, value := range append(append([]float64(nil), r...), u...) {
+		if !isFinite(value) {
+			return nil, errors.New("return or portfolio contains a non-finite value")
+		}
+	}
+	den := dot(r, u)
+	if !isFinite(den) || den <= 1e-12 {
+		return nil, errors.New("portfolio return is too small for a stable gradient")
+	}
+	gradient := make([]float64, len(r))
+	for i := range r {
+		gradient[i] = -r[i] / den
+	}
+	return gradient, nil
+}
+
+func validBarrierInputs(w, nt []float64) bool {
+	if len(w) == 0 || len(w) != len(nt) {
+		return false
+	}
+	for i := range w {
+		if !isFinite(w[i]) || w[i] <= 0 || !isFinite(nt[i]) || nt[i] <= 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // ─────────────────────────────────────────────
 // Barrier + quadratic terms
 // ─────────────────────────────────────────────
@@ -404,6 +510,10 @@ func (m *MetaDONS) Update(r []float64, t int) {
 		value := dot(r, e.portfolio)
 		if value <= 0 || !isFinite(value) {
 			e.numericalFailures++
+			if e.numericalFailures >= 3 {
+				e.state = ExpertRetired
+				e.end = t
+			}
 			continue
 		}
 		// Expert weight update in the paper's notation:
@@ -453,6 +563,9 @@ func logAdd(a, b float64) float64 {
 	return a + math.Log1p(math.Exp(b-a))
 }
 func topK(w []float64, K int) []float64 {
+	if K <= 0 || len(w) == 0 {
+		return make([]float64, len(w))
+	}
 	if K > len(w) {
 		K = len(w)
 	}
@@ -483,6 +596,11 @@ func topK(w []float64, K int) []float64 {
 	for i := range wSparse {
 		if wSparse[i] > 0 {
 			wSparse[i] /= sumTop
+		}
+	}
+	if sumTop <= 0 || !isFinite(sumTop) {
+		for i := 0; i < K; i++ {
+			wSparse[arr[i].idx] = 1 / float64(K)
 		}
 	}
 
@@ -521,9 +639,10 @@ func smoothed(w []float64, d, T int) []float64 {
 }
 
 type newtonSolveResult struct {
-	delta              []float64
-	kktResidual        float64
-	constraintResidual float64
+	delta               []float64
+	kktResidual         float64
+	relativeKKTResidual float64
+	constraintResidual  float64
 }
 
 func solveConstrainedNewtonDetailed(H *mat.Dense, grad []float64) (newtonSolveResult, error) {
@@ -562,10 +681,17 @@ func solveConstrainedNewtonDetailed(H *mat.Dense, grad []float64) (newtonSolveRe
 	}
 	residual[d] = sum(delta)
 
+	residualNorm := vectorNorm(residual[:d])
+	gradientNorm := vectorNorm(grad)
+	hessianNorm := matrixInfinityNorm(H)
+	deltaNorm := vectorNorm(delta)
+	relativeResidual := residualNorm / (1 + gradientNorm + hessianNorm*deltaNorm)
+
 	return newtonSolveResult{
-		delta:              delta,
-		kktResidual:        vectorNorm(residual[:d]),
-		constraintResidual: math.Abs(residual[d]),
+		delta:               delta,
+		kktResidual:         residualNorm,
+		relativeKKTResidual: relativeResidual,
+		constraintResidual:  math.Abs(residual[d]),
 	}, nil
 }
 
@@ -583,6 +709,31 @@ func vectorNorm(values []float64) float64 {
 		norm += value * value
 	}
 	return math.Sqrt(norm)
+}
+
+func matrixInfinityNorm(matrix *mat.Dense) float64 {
+	rows, cols := matrix.Dims()
+	norm := 0.0
+	for i := 0; i < rows; i++ {
+		rowSum := 0.0
+		for j := 0; j < cols; j++ {
+			rowSum += math.Abs(matrix.At(i, j))
+		}
+		norm = math.Max(norm, rowSum)
+	}
+	return norm
+}
+
+func diagonalHessianNorm(hessian [][]float64) float64 {
+	norm := 0.0
+	for i := range hessian {
+		rowSum := 0.0
+		for _, value := range hessian[i] {
+			rowSum += math.Abs(value)
+		}
+		norm = math.Max(norm, rowSum)
+	}
+	return norm
 }
 
 func (d *DONS) stabilizedQuadraticHessian() (*mat.Dense, float64) {
@@ -635,14 +786,14 @@ func (d *DONS) stabilizedQuadraticHessian() (*mat.Dense, float64) {
 	return q, regularization
 }
 
-func quadraticObjective(w, nt []float64, q *mat.Dense, offset []float64) float64 {
+func quadraticObjective(w, nt []float64, q *mat.Dense, offset, linear []float64) float64 {
 	value := 0.0
 	for i := range w {
 		if w[i] <= 0 || !isFinite(w[i]) {
 			return math.Inf(1)
 		}
 		value -= nt[i] * math.Log(w[i])
-		value += offset[i] * w[i]
+		value += (offset[i] + linear[i]) * w[i]
 		for j := range w {
 			value += 0.5 * w[i] * q.At(i, j) * w[j]
 		}
@@ -650,30 +801,72 @@ func quadraticObjective(w, nt []float64, q *mat.Dense, offset []float64) float64
 	return value
 }
 
+func maxInteriorStep(w, delta []float64, epsilon float64) float64 {
+	step := math.Inf(1)
+	for i := range w {
+		if delta[i] < 0 {
+			step = math.Min(step, (w[i]-epsilon)/-delta[i])
+		}
+	}
+	if math.IsInf(step, 1) {
+		return 1
+	}
+	return math.Max(0, 0.99*step)
+}
+
 func (d *DONS) Update(r []float64, T int) {
 	d.lastNewtonDecrement = 0
 	d.lastKKTResidual = math.Inf(1)
+	d.lastRelativeKKTResidual = math.Inf(1)
 	d.lastConstraintResidual = math.Inf(1)
 	d.lastHessianRegularization = 0
 	d.lastNewtonAccepted = false
+	d.lastRawStepNorm = 0
+	d.lastAcceptedStepNorm = 0
+	d.lastStepSize = 0
+	d.lastBacktrackingAttempts = 0
+	d.lastObjectiveBefore = math.Inf(1)
+	d.lastObjectiveAfter = math.Inf(1)
+	d.lastProjectionFallback = false
+	d.lastMaxWeightChange = 0
+	d.lastGradientNorm = 0
+	d.lastProjectedGradientNorm = 0
+	d.lastBarrierHessianNorm = 0
+	d.lastQuadraticHessianNorm = 0
+	d.lastCombinedHessianNorm = 0
 
 	u := d.pending
 	if u == nil {
 		u = d.Predict(T)
 	}
-	g := coverGradient(r, u)
+	d.pending = nil
+	g, err := checkedCoverGradient(r, u)
+	if err != nil {
+		return
+	}
 	addQuadraticTerm(d, g, d.w)
 	d.updateP(u)
 	nt := d.computeNt(float64(T))
+	if !validBarrierInputs(d.w, nt) {
+		return
+	}
 	q, regularization := d.stabilizedQuadraticHessian()
 	d.lastHessianRegularization = regularization
 	grad := barrierGrad(d.w, nt)
 	for i := range grad {
+		grad[i] += g[i]
 		for j := 0; j < d.d; j++ {
 			grad[i] += q.At(i, j) * d.w[j]
 		}
 		grad[i] += d.quadOffset[i]
 	}
+	d.lastGradientNorm = vectorNorm(grad)
+	projectedGradient := append([]float64(nil), grad...)
+	projectedMean := sum(projectedGradient) / float64(len(projectedGradient))
+	for i := range projectedGradient {
+		projectedGradient[i] -= projectedMean
+	}
+	d.lastProjectedGradientNorm = vectorNorm(projectedGradient)
 
 	// The Newton step solves the constrained KKT system for the barrier-plus-quadratic objective.
 	// This is kept structurally close to the paper's damped-update form, while remaining
@@ -685,10 +878,17 @@ func (d *DONS) Update(r []float64, T int) {
 			H.Set(i, j, barrierH[i][j]+q.At(i, j))
 		}
 	}
+	d.lastBarrierHessianNorm = diagonalHessianNorm(barrierH)
+	d.lastQuadraticHessianNorm = matrixInfinityNorm(q)
+	d.lastCombinedHessianNorm = matrixInfinityNorm(H)
 
 	result, err := solveConstrainedNewtonDetailed(H, grad)
 	for attempt := 0; err != nil && attempt < 3; attempt++ {
-		ridge := math.Max(1e-8, math.Pow10(attempt)*1e-6)
+		hessianScale := 0.0
+		for i := 0; i < d.d; i++ {
+			hessianScale = math.Max(hessianScale, math.Abs(H.At(i, i)))
+		}
+		ridge := math.Max(1e-12, hessianScale*1e-8) * math.Pow10(attempt)
 		for i := 0; i < d.d; i++ {
 			d.quadHess.Set(i, i, d.quadHess.At(i, i)+ridge)
 			q.Set(i, i, q.At(i, i)+ridge)
@@ -701,26 +901,66 @@ func (d *DONS) Update(r []float64, T int) {
 		return
 	}
 	d.lastKKTResidual = result.kktResidual
+	d.lastRelativeKKTResidual = result.relativeKKTResidual
 	d.lastConstraintResidual = result.constraintResidual
 	decrement := math.Max(0, -dot(grad, result.delta))
 	d.lastNewtonDecrement = decrement
 	den := 1 + 4*math.Sqrt(decrement)
-	step := d.gamma / den
-	oldObjective := quadraticObjective(d.w, nt, q, d.quadOffset)
+	rawStep := d.gamma / den
+	step := math.Min(rawStep, maxInteriorStep(d.w, result.delta, d.epsilon))
+	d.lastRawStepNorm = rawStep * vectorNorm(result.delta)
+	d.lastStepSize = step
+	oldObjective := quadraticObjective(d.w, nt, q, d.quadOffset, g)
+	d.lastObjectiveBefore = oldObjective
 	for attempt := 0; attempt < 12; attempt++ {
-		next := make([]float64, d.d)
-		for i := range next {
-			next[i] = d.w[i] + step*result.delta[i]
+		candidate := make([]float64, d.d)
+		for i := range candidate {
+			candidate[i] = d.w[i] + step*result.delta[i]
 		}
-		next = projectInterior(next, d.epsilon)
-		newObjective := quadraticObjective(next, nt, q, d.quadOffset)
+		next := candidate
+		if math.Abs(sum(candidate)-1) > 1e-10 || !allInterior(candidate, d.epsilon) {
+			next = projectInterior(candidate, d.epsilon)
+			d.lastProjectionFallback = true
+		}
+		newObjective := quadraticObjective(next, nt, q, d.quadOffset, g)
 		if isFinite(newObjective) && newObjective <= oldObjective+1e-12*(1+math.Abs(oldObjective)) {
+			previousWeights := append([]float64(nil), d.w...)
 			d.w = next
 			d.lastNewtonAccepted = true
+			stepDifference := make([]float64, len(next))
+			for i := range next {
+				stepDifference[i] = next[i] - previousWeights[i]
+			}
+			d.lastAcceptedStepNorm = vectorNorm(stepDifference)
+			d.lastBacktrackingAttempts = attempt
+			d.lastObjectiveAfter = newObjective
+			d.lastMaxWeightChange = maxWeightChange(previousWeights, next)
 			return
 		}
 		step *= 0.5
+		d.lastStepSize = step
 	}
+	d.lastBacktrackingAttempts = 12
+}
+
+func allInterior(values []float64, epsilon float64) bool {
+	for _, value := range values {
+		if !isFinite(value) || value < epsilon {
+			return false
+		}
+	}
+	return true
+}
+
+func maxWeightChange(before, after []float64) float64 {
+	if len(before) != len(after) {
+		return math.Inf(1)
+	}
+	maximum := 0.0
+	for i := range before {
+		maximum = math.Max(maximum, math.Abs(after[i]-before[i]))
+	}
+	return maximum
 }
 
 // ─────────────────────────────────────────────
@@ -796,10 +1036,28 @@ func plotSeries(filename string, series []float64, title string) error {
 	return p.Save(8*vg.Inch, 4*vg.Inch, filename)
 }
 
+type PreprocessingAudit struct {
+	ForwardFilledPrices  int
+	LeadingMissingPrices int
+	InvalidPricePairs    int
+	NonFiniteReturns     int
+	ClampedLowReturns    int
+	ClampedHighReturns   int
+}
+
 // BuildReturnMatrix: prices -> aligned multiplicative returns
-func BuildReturnMatrix(all map[string][]data.PricesStruct, universe data.Universe) ([][]float64, []time.Time, error) {
+func BuildReturnMatrix(all map[string][]data.PricesStruct, universe data.Universe) ([][]float64, []time.Time, PreprocessingAudit, error) {
 	tickers := universe.Tickers
 	d := len(tickers)
+	audit := PreprocessingAudit{}
+	if d == 0 {
+		return nil, nil, audit, errors.New("universe has no tickers")
+	}
+	for _, ticker := range tickers {
+		if len(all[ticker]) == 0 {
+			return nil, nil, audit, fmt.Errorf("no prices for ticker %s", ticker)
+		}
+	}
 
 	// Collect all dates
 	dateMap := make(map[time.Time]bool)
@@ -847,6 +1105,9 @@ func BuildReturnMatrix(all map[string][]data.PricesStruct, universe data.Univers
 				haveLast = true
 			} else if haveLast {
 				priceMatrix[i][j] = last
+				audit.ForwardFilledPrices++
+			} else {
+				audit.LeadingMissingPrices++
 			}
 		}
 	}
@@ -863,6 +1124,7 @@ func BuildReturnMatrix(all map[string][]data.PricesStruct, universe data.Univers
 			// invalid prices → neutral multiplier
 			if p0 <= 0 || p1 <= 0 || math.IsNaN(p0) || math.IsNaN(p1) {
 				R[t-1][j] = 1.0
+				audit.InvalidPricePairs++
 				continue
 			}
 
@@ -871,22 +1133,25 @@ func BuildReturnMatrix(all map[string][]data.PricesStruct, universe data.Univers
 			// sanitize only NaN/Inf
 			if math.IsNaN(r) || math.IsInf(r, 0) {
 				R[t-1][j] = 1.0
+				audit.NonFiniteReturns++
 				continue
 			}
 
 			// IMPORTANT: clamp extreme values
 			if r < 0.5 {
 				r = 0.5
+				audit.ClampedLowReturns++
 			}
 			if r > 1.5 {
 				r = 1.5
+				audit.ClampedHighReturns++
 			}
 
 			R[t-1][j] = r
 		}
 	}
 
-	return R, dates[1:], nil
+	return R, dates[1:], audit, nil
 }
 
 func comparatorSPY(universe data.Universe) []float64 {
@@ -936,7 +1201,31 @@ func sum(w []float64) float64 {
 	return s
 }
 
-func runTest(
+type BacktestResult struct {
+	AlgoWealth    []float64
+	DenseWealth   []float64
+	SPYWealth     []float64
+	BestWealth    []float64
+	Records       [][]string
+	WeightRecords [][]string
+	Trades        [][]string
+	Diagnostics   [][]string
+}
+
+func priceLookup(allPrices map[string][]data.PricesStruct) map[string]map[time.Time]float64 {
+	lookup := make(map[string]map[time.Time]float64, len(allPrices))
+	for ticker, prices := range allPrices {
+		lookup[ticker] = make(map[time.Time]float64, len(prices))
+		for _, price := range prices {
+			if len(price.Prices) > 0 && price.Prices[0] > 0 && isFinite(price.Prices[0]) {
+				lookup[ticker][price.Date] = price.Prices[0]
+			}
+		}
+	}
+	return lookup
+}
+
+func runTestDetailed(
 	Rtest [][]float64,
 	datesTest []time.Time,
 	tickers []string,
@@ -944,48 +1233,67 @@ func runTest(
 	uSPY []float64,
 	uBest []float64,
 	meta *MetaDONS,
-	executionK int,
-) (
-	[]float64,
-	[]float64,
-	[]float64,
-	[][]string,
-	[][]string,
-	[][]string,
-) {
+	config Config,
+) BacktestResult {
 	T := len(Rtest)
 	d := len(tickers)
+	if T == 0 {
+		return BacktestResult{}
+	}
+	if len(datesTest) != T {
+		return BacktestResult{}
+	}
+	if len(uSPY) != d || len(uBest) != d {
+		return BacktestResult{}
+	}
+	for _, row := range Rtest {
+		if len(row) != d {
+			return BacktestResult{}
+		}
+	}
 
-	algoWealth := make([]float64, T)
-	spyWealth := make([]float64, T)
-	bestWealth := make([]float64, T)
+	// Rtest[t] is the return ending on datesTest[t]. Keep index 0 as the
+	// initial wealth before the first test-period return is applied.
+	algoWealth := make([]float64, T+1)
+	denseWealth := make([]float64, T+1)
+	spyWealth := make([]float64, T+1)
+	bestWealth := make([]float64, T+1)
+	algoLogWealth := make([]float64, T+1)
+	spyLogWealth := make([]float64, T+1)
+	bestLogWealth := make([]float64, T+1)
+	denseLogWealth := make([]float64, T+1)
 
 	algoWealth[0] = 1.0
 	spyWealth[0] = 1.0
 	bestWealth[0] = 1.0
+	denseWealth[0] = 1.0
 
-	records := [][]string{{"t", "date", "ret_algo", "ret_spy", "ret_best", "wealth_algo", "wealth_spy", "wealth_best"}}
+	records := [][]string{{"t", "date", "ret_executed_net", "ret_dense", "ret_spy", "ret_best", "turnover", "wealth_executed_net", "wealth_dense", "wealth_spy", "wealth_best"}}
 
 	weightRecords := [][]string{}
 	header := append([]string{"t", "date"}, tickers...)
 	weightRecords = append(weightRecords, header)
 
 	trades := [][]string{{"t", "date", "ticker", "entry", "exit", "weight"}}
+	diagnostics := [][]string{{"t", "date", "turnover", "active_experts", "retired_experts", "invalid_expert_updates", "max_newton_decrement", "max_relative_kkt_residual", "max_constraint_residual", "max_hessian_regularization", "accepted_newton_steps", "max_raw_step_norm", "max_accepted_step_norm", "max_step_size", "max_backtracking_attempts", "min_objective_before", "max_objective_after", "max_weight_change", "projection_fallbacks", "max_gradient_norm", "max_projected_gradient_norm", "max_barrier_hessian_norm", "max_quadratic_hessian_norm", "max_combined_hessian_norm"}}
 
-	prevPrices := make([]float64, d)
+	pricesByDate := priceLookup(allPrices)
+	prevPrices := make(map[string]float64, d)
+	previousExecuted := make([]float64, d)
 	for j := 0; j < d; j++ {
-		prevPrices[j] = allPrices[tickers[j]][0].Prices[0]
+		previousExecuted[j] = 1 / float64(d)
 	}
 
 	w := make([]float64, d)
 	iter := 0
 
-	for t := 1; t < T; t++ {
+	for t := 0; t < T; t++ {
 		rToday := Rtest[t]
+		wealthIndex := t + 1
 
 		// Select the portfolio before observing today's return.
 		w = meta.Predict(iter)
-		row := []string{fmt.Sprintf("%d", t), datesTest[t].Format("2006-01-02")}
+		row := []string{fmt.Sprintf("%d", wealthIndex), datesTest[t].Format("2006-01-02")}
 		for _, weight := range w {
 			row = append(row, fmt.Sprintf("%.6f", weight))
 		}
@@ -998,15 +1306,22 @@ func runTest(
 			if w[j] <= 1e-12 {
 				continue
 			}
-			currPrice := allPrices[tickers[j]][t].Prices[0]
+			currPrice, ok := pricesByDate[tickers[j]][datesTest[t]]
+			if !ok {
+				continue
+			}
 			tickersOut = append(tickersOut, tickers[j])
-			entriesOut = append(entriesOut, fmt.Sprintf("%.4f", prevPrices[j]))
+			entryPrice := currPrice
+			if previousPrice, exists := prevPrices[tickers[j]]; exists {
+				entryPrice = previousPrice
+			}
+			entriesOut = append(entriesOut, fmt.Sprintf("%.4f", entryPrice))
 			exitsOut = append(exitsOut, fmt.Sprintf("%.4f", currPrice))
 			weightsOut = append(weightsOut, fmt.Sprintf("%.6f", w[j]))
-			prevPrices[j] = currPrice
+			prevPrices[tickers[j]] = currPrice
 		}
 		trades = append(trades, []string{
-			fmt.Sprintf("%d", t),
+			fmt.Sprintf("%d", wealthIndex),
 			datesTest[t].Format("2006-01-02"),
 			strings.Join(tickersOut, " "),
 			strings.Join(entriesOut, " "),
@@ -1015,10 +1330,14 @@ func runTest(
 		})
 		// DAILY COMPOUNDING. Zero means execute the dense learner output.
 		executed := w
-		if executionK > 0 {
-			executed = topK(w, executionK)
+		if config.TopK > 0 {
+			executed = topK(w, config.TopK)
 		}
+		turnover := 0.5 * l1Distance(executed, previousExecuted)
+		retDense := dotSafe(rToday, w)
 		retAlgo := dotSafe(rToday, executed)
+		retAlgo *= math.Max(0, 1-config.TransactionCost*turnover)
+		previousExecuted = append(previousExecuted[:0], executed...)
 
 		retSPY := dotSafe(rToday, uSPY)
 		retBest := dotSafe(rToday, uBest)
@@ -1028,37 +1347,129 @@ func runTest(
 		if retAlgo <= 0 || math.IsNaN(retAlgo) || math.IsInf(retAlgo, 0) {
 			retAlgo = 1.0
 		}
+		if retDense <= 0 || math.IsNaN(retDense) || math.IsInf(retDense, 0) {
+			retDense = 1.0
+		}
 		if retSPY <= 0 || math.IsNaN(retSPY) || math.IsInf(retSPY, 0) {
 			retSPY = 1.0
 		}
 		if retBest <= 0 || math.IsNaN(retBest) || math.IsInf(retBest, 0) {
 			retBest = 1.0
 		}
+		algoLogWealth[wealthIndex] = algoLogWealth[wealthIndex-1] + math.Log(retAlgo)
+		denseLogWealth[wealthIndex] = denseLogWealth[wealthIndex-1] + math.Log(retDense)
+		spyLogWealth[wealthIndex] = spyLogWealth[wealthIndex-1] + math.Log(retSPY)
+		bestLogWealth[wealthIndex] = bestLogWealth[wealthIndex-1] + math.Log(retBest)
+		algoWealth[wealthIndex] = wealthFromLog(algoLogWealth[wealthIndex])
+		denseWealth[wealthIndex] = wealthFromLog(denseLogWealth[wealthIndex])
+		spyWealth[wealthIndex] = wealthFromLog(spyLogWealth[wealthIndex])
+		bestWealth[wealthIndex] = wealthFromLog(bestLogWealth[wealthIndex])
 		records = append(records, []string{
-			fmt.Sprintf("%d", t),
+			fmt.Sprintf("%d", wealthIndex),
 			datesTest[t].Format("2006-01-02"),
 			fmt.Sprintf("%.6f", retAlgo),
+			fmt.Sprintf("%.6f", retDense),
 			fmt.Sprintf("%.6f", retSPY),
 			fmt.Sprintf("%.6f", retBest),
+			fmt.Sprintf("%.6f", turnover),
+			fmt.Sprintf("%.6f", algoWealth[wealthIndex]),
+			fmt.Sprintf("%.6f", denseWealth[wealthIndex]),
+			fmt.Sprintf("%.6f", spyWealth[wealthIndex]),
+			fmt.Sprintf("%.6f", bestWealth[wealthIndex]),
 		})
 
-		algoWealth[t] = algoWealth[t-1] * retAlgo
-		spyWealth[t] = spyWealth[t-1] * retSPY
-		bestWealth[t] = bestWealth[t-1] * retBest
-		records = append(records, []string{
-			fmt.Sprintf("%d", t),
-			datesTest[t].Format("2006-01-02"),
-			fmt.Sprintf("%.6f", retAlgo),
-			fmt.Sprintf("%.6f", retSPY),
-			fmt.Sprintf("%.6f", retBest),
-			fmt.Sprintf("%.6f", algoWealth[t]),
-			fmt.Sprintf("%.6f", spyWealth[t]),
-			fmt.Sprintf("%.6f", bestWealth[t]),
+		maxDecrement := 0.0
+		maxRelativeKKT := 0.0
+		maxConstraint := 0.0
+		maxRegularization := 0.0
+		acceptedSteps := 0
+		invalidUpdates := 0
+		maxRawStepNorm := 0.0
+		maxAcceptedStepNorm := 0.0
+		maxStepSize := 0.0
+		maxBacktracking := 0
+		minObjectiveBefore := math.Inf(1)
+		maxObjectiveAfter := math.Inf(-1)
+		maxWeightChangeValue := 0.0
+		projectionFallbacks := 0
+		maxGradientNorm := 0.0
+		maxProjectedGradientNorm := 0.0
+		maxBarrierHessianNorm := 0.0
+		maxQuadraticHessianNorm := 0.0
+		maxCombinedHessianNorm := 0.0
+		activeExperts := meta.activeExperts(iter)
+		for _, expert := range activeExperts {
+			maxDecrement = math.Max(maxDecrement, expert.dons.lastNewtonDecrement)
+			maxRelativeKKT = math.Max(maxRelativeKKT, expert.dons.lastRelativeKKTResidual)
+			maxConstraint = math.Max(maxConstraint, expert.dons.lastConstraintResidual)
+			maxRegularization = math.Max(maxRegularization, expert.dons.lastHessianRegularization)
+			if expert.dons.lastNewtonAccepted {
+				acceptedSteps++
+			}
+			maxRawStepNorm = math.Max(maxRawStepNorm, expert.dons.lastRawStepNorm)
+			maxAcceptedStepNorm = math.Max(maxAcceptedStepNorm, expert.dons.lastAcceptedStepNorm)
+			maxStepSize = math.Max(maxStepSize, expert.dons.lastStepSize)
+			maxBacktracking = maxInt(maxBacktracking, expert.dons.lastBacktrackingAttempts)
+			minObjectiveBefore = math.Min(minObjectiveBefore, expert.dons.lastObjectiveBefore)
+			maxObjectiveAfter = math.Max(maxObjectiveAfter, expert.dons.lastObjectiveAfter)
+			maxWeightChangeValue = math.Max(maxWeightChangeValue, expert.dons.lastMaxWeightChange)
+			if expert.dons.lastProjectionFallback {
+				projectionFallbacks++
+			}
+			maxGradientNorm = math.Max(maxGradientNorm, expert.dons.lastGradientNorm)
+			maxProjectedGradientNorm = math.Max(maxProjectedGradientNorm, expert.dons.lastProjectedGradientNorm)
+			maxBarrierHessianNorm = math.Max(maxBarrierHessianNorm, expert.dons.lastBarrierHessianNorm)
+			maxQuadraticHessianNorm = math.Max(maxQuadraticHessianNorm, expert.dons.lastQuadraticHessianNorm)
+			maxCombinedHessianNorm = math.Max(maxCombinedHessianNorm, expert.dons.lastCombinedHessianNorm)
+			invalidUpdates += expert.numericalFailures
+		}
+		if math.IsInf(minObjectiveBefore, 1) {
+			minObjectiveBefore = 0
+		}
+		if math.IsInf(maxObjectiveAfter, -1) {
+			maxObjectiveAfter = 0
+		}
+		diagnostics = append(diagnostics, []string{
+			fmt.Sprintf("%d", wealthIndex), datesTest[t].Format("2006-01-02"),
+			fmt.Sprintf("%.6f", turnover), fmt.Sprintf("%d", len(activeExperts)),
+			fmt.Sprintf("%d", meta.retired), fmt.Sprintf("%d", invalidUpdates),
+			fmt.Sprintf("%.6g", maxDecrement), fmt.Sprintf("%.6g", maxRelativeKKT),
+			fmt.Sprintf("%.6g", maxConstraint), fmt.Sprintf("%.6g", maxRegularization),
+			fmt.Sprintf("%d", acceptedSteps),
+			fmt.Sprintf("%.6g", maxRawStepNorm), fmt.Sprintf("%.6g", maxAcceptedStepNorm),
+			fmt.Sprintf("%.6g", maxStepSize), fmt.Sprintf("%d", maxBacktracking),
+			fmt.Sprintf("%.6g", minObjectiveBefore), fmt.Sprintf("%.6g", maxObjectiveAfter),
+			fmt.Sprintf("%.6g", maxWeightChangeValue), fmt.Sprintf("%d", projectionFallbacks),
+			fmt.Sprintf("%.6g", maxGradientNorm), fmt.Sprintf("%.6g", maxProjectedGradientNorm),
+			fmt.Sprintf("%.6g", maxBarrierHessianNorm), fmt.Sprintf("%.6g", maxQuadraticHessianNorm),
+			fmt.Sprintf("%.6g", maxCombinedHessianNorm),
 		})
 
 	}
 
-	return algoWealth, spyWealth, bestWealth, records, weightRecords, trades
+	return BacktestResult{
+		AlgoWealth: algoWealth, DenseWealth: denseWealth, SPYWealth: spyWealth,
+		BestWealth: bestWealth, Records: records, WeightRecords: weightRecords,
+		Trades: trades, Diagnostics: diagnostics,
+	}
+}
+
+func runTest(Rtest [][]float64, datesTest []time.Time, tickers []string, allPrices map[string][]data.PricesStruct, uSPY, uBest []float64, meta *MetaDONS, executionK int) ([]float64, []float64, []float64, [][]string, [][]string, [][]string) {
+	config := DefaultConfig()
+	config.TopK = executionK
+	result := runTestDetailed(Rtest, datesTest, tickers, allPrices, uSPY, uBest, meta, config)
+	return result.AlgoWealth, result.SPYWealth, result.BestWealth, result.Records, result.WeightRecords, result.Trades
+}
+
+func l1Distance(a, b []float64) float64 {
+	if len(a) != len(b) {
+		return math.Inf(1)
+	}
+	distance := 0.0
+	for i := range a {
+		distance += math.Abs(a[i] - b[i])
+	}
+	return distance
 }
 func dotSafe(r, w []float64) float64 {
 	sum := 0.0
@@ -1069,6 +1480,16 @@ func dotSafe(r, w []float64) float64 {
 		sum += w[i] * r[i]
 	}
 	return sum
+}
+
+func wealthFromLog(logWealth float64) float64 {
+	if logWealth >= math.Log(math.MaxFloat64) {
+		return math.MaxFloat64
+	}
+	if logWealth <= math.Log(math.SmallestNonzeroFloat64) {
+		return 0
+	}
+	return math.Exp(logWealth)
 }
 
 func periodicReturns(wealth []float64) []float64 {
@@ -1141,18 +1562,18 @@ func maxDrawdown(wealth []float64) float64 {
 }
 
 func main() {
-	executionK := flag.Int("top-k", 0, "execute only the top K assets; 0 keeps the dense portfolio")
-	gamma := flag.Float64("gamma", 3.0, "Newton damping multiplier")
-	momentum := flag.Float64("momentum", 0.0, "heuristic momentum overlay; 0 disables it")
+	config := DefaultConfig()
+	executionK := flag.Int("top-k", config.TopK, "execute only the top K assets; 0 keeps the dense portfolio")
+	gamma := flag.Float64("gamma", config.Gamma, "Newton damping multiplier")
+	momentum := flag.Float64("momentum", config.Momentum, "heuristic momentum overlay; 0 disables it")
+	transactionCost := flag.Float64("transaction-cost", config.TransactionCost, "proportional cost per unit turnover")
 	flag.Parse()
-	if *executionK < 0 {
-		log.Fatal("top-k must be non-negative")
-	}
-	if *gamma <= 0 {
-		log.Fatal("gamma must be positive")
-	}
-	if *momentum < 0 || *momentum >= 1 {
-		log.Fatal("momentum must be at least 0 and less than 1")
+	config.TopK = *executionK
+	config.Gamma = *gamma
+	config.Momentum = *momentum
+	config.TransactionCost = *transactionCost
+	if err := config.Validate(); err != nil {
+		log.Fatal(err)
 	}
 
 	// --- Load universe ---
@@ -1168,7 +1589,7 @@ func main() {
 	}
 
 	// --- Build generic return matrix ---
-	R, dates, err := BuildReturnMatrix(allPrices, universe)
+	R, dates, audit, err := BuildReturnMatrix(allPrices, universe)
 	if err != nil {
 		log.Fatalf("build returns: %v", err)
 	}
@@ -1188,31 +1609,35 @@ func main() {
 
 	d := len(universe.Tickers)
 	Ttest := len(Rtest)
+	if d == 0 || Ttest == 0 {
+		log.Fatal("no test data remains after building the return matrix")
+	}
 
 	// --- MetaDONS parameters ---
 
-	eta := 0.15
-
-	meta := NewMetaDONS(d, Ttest, eta)
-	meta.SetDONSParameters(*gamma, *momentum)
+	meta := NewMetaDONSWithConfig(d, Ttest, config)
 
 	// --- Comparator vectors ---
 	uSPY := comparatorSPY(universe)
 	uBest := bestSingleAssetInHindsight(Rtest)
 
 	// --- Run the generic backtest engine ---
-	algoWealth, spyWealth, bestWealth,
-		records, weightRecords, trades :=
-		runTest(
-			Rtest,
-			datesTest,
-			universe.Tickers,
-			allPrices,
-			uSPY,
-			uBest,
-			meta,
-			*executionK,
-		)
+	backtest := runTestDetailed(
+		Rtest,
+		datesTest,
+		universe.Tickers,
+		allPrices,
+		uSPY,
+		uBest,
+		meta,
+		config,
+	)
+	algoWealth := backtest.AlgoWealth
+	spyWealth := backtest.SPYWealth
+	bestWealth := backtest.BestWealth
+	records := backtest.Records
+	weightRecords := backtest.WeightRecords
+	trades := backtest.Trades
 
 	// --- Print summary ---
 	log.Printf("Test period: %s to %s",
@@ -1224,6 +1649,11 @@ func main() {
 		algoWealth[len(algoWealth)-1],
 		spyWealth[len(spyWealth)-1],
 		bestWealth[len(bestWealth)-1],
+	)
+	log.Printf("Final wealth: Dense=%.4f, ExecutedNet=%.4f, turnover cost=%.6f",
+		backtest.DenseWealth[len(backtest.DenseWealth)-1],
+		backtest.AlgoWealth[len(backtest.AlgoWealth)-1],
+		config.TransactionCost,
 	)
 
 	algoReturns := periodicReturns(algoWealth)
@@ -1247,6 +1677,20 @@ func main() {
 	}
 
 	if err := writeCSV("analysis/trades.csv", trades); err != nil {
+		log.Fatalf("CSV error: %v", err)
+	}
+	if err := writeCSV("analysis/diagnostics.csv", backtest.Diagnostics); err != nil {
+		log.Fatalf("CSV error: %v", err)
+	}
+	auditRecords := [][]string{{"metric", "count"},
+		{"forward_filled_prices", fmt.Sprintf("%d", audit.ForwardFilledPrices)},
+		{"leading_missing_prices", fmt.Sprintf("%d", audit.LeadingMissingPrices)},
+		{"invalid_price_pairs", fmt.Sprintf("%d", audit.InvalidPricePairs)},
+		{"non_finite_returns", fmt.Sprintf("%d", audit.NonFiniteReturns)},
+		{"clamped_low_returns", fmt.Sprintf("%d", audit.ClampedLowReturns)},
+		{"clamped_high_returns", fmt.Sprintf("%d", audit.ClampedHighReturns)},
+	}
+	if err := writeCSV("analysis/preprocessing_audit.csv", auditRecords); err != nil {
 		log.Fatalf("CSV error: %v", err)
 	}
 	if err := plotSeries("analysis/strategy.png", algoWealth, "Strategy"); err != nil {

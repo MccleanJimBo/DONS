@@ -83,3 +83,61 @@ The implementation should preserve top-$K$ selection, `gamma`, and momentum as e
 10. **Add focused coverage and diagnostics.** Test strict simplex interior and finite values, causal ordering, gradient correctness, barrier scheduling, Newton decrement/damping, meta-expert lifecycle, and aggregate normalization. Add a deterministic small-return regression case.
 
 Implement in two passes: first the causal, strictly interior base DONS with tests; then the interval meta-algorithm and separate sparse-execution layer. This keeps failures local and clearly distinguishes paper-compatible results from strategy-specific results.
+
+## Implementation Status (2026-09-09)
+
+The following items from the original review have now been implemented in the Go prototype:
+
+- **Causal prediction/update flow.** `Predict` runs before the current return is applied, and `Update` consumes the observed return afterward. The return/date indexing was corrected so the first test return is no longer skipped.
+- **Strict interior portfolios.** Portfolio outputs are normalized on the simplex with a positive coordinate floor. Barrier derivatives are validated before use.
+- **Correct cover-loss gradient.** The observed loss gradient uses $g_t = -r_t / \langle r_t,u_t\rangle$ and is now included consistently in both the Newton gradient and the objective used for step acceptance.
+- **Adaptive barrier state.** Barrier state and time-varying barrier strengths are maintained through named `BarrierState` methods. This remains a paper-inspired approximation.
+- **Constrained Newton diagnostics and safeguards.** The KKT system reports absolute and relative residuals, Newton decrement, constraint residual, Hessian regularization, step size, backtracking, objective values, and projection fallback status. Invalid or poorly conditioned curvature is regularized or reset.
+- **Feasibility-preserving updates.** Newton steps are capped to remain in the strict simplex interior; projection is retained as a fallback rather than the normal path.
+- **Expert lifecycle handling.** Experts have sleeping, active, and retired states; intervals are explicit; local horizons and priors are assigned; expired experts are retired; repeated invalid expert returns trigger retirement.
+- **Explicit configuration.** Barrier strength, beta, eta, gamma, momentum, top-k, and transaction cost are represented by a validated `Config` struct. Existing constructor compatibility is retained.
+- **Date-aligned backtesting.** Trade prices are looked up by actual dates rather than raw price-slice indices. Empty and dimension-mismatched inputs are rejected or safely handled.
+- **Execution and cost accounting.** Dense learner wealth is tracked separately from executed wealth. Top-k execution is treated as an overlay, turnover is measured, and proportional transaction costs are supported with `-transaction-cost`.
+- **Diagnostics and audit output.** The program writes `analysis/diagnostics.csv` and `analysis/preprocessing_audit.csv`. The latter records forward fills, leading missing values, invalid pairs, non-finite returns, and return clamps.
+- **Deterministic tests.** The test suite covers causal updates, strict simplex behavior, gradient checks, barrier adaptation, expert lifecycle, Newton residuals, log-domain wealth, return/date alignment, synthetic constant returns, and alternating-winner returns.
+
+The implementation is still a practical, paper-inspired approximation. It should not claim the paper's formal regret or complexity guarantees.
+
+## Current Diagnostic Finding
+
+A fresh run with `gamma = 10` produced stable numerical solves and nonzero feasible movement after the observed loss gradient was added to the Newton objective. The first diagnostic row showed approximately:
+
+- gradient norm: `867.265`
+- simplex-projected gradient norm: `0.125307`
+- barrier Hessian norm: `6498`
+- quadratic Hessian norm: `14.86`
+- combined Hessian norm: `6512.86`
+- raw step norm: `0.000191434`
+- accepted step norm: `0.0000239292`
+- projection fallbacks: `0`
+
+The earlier near-zero projected-gradient pathology is therefore fixed. The remaining movement is small because the barrier curvature is large and objective backtracking reduces some steps. The final portfolio is no longer exactly uniform, but the change remains modest.
+
+## Further Recommended Work
+
+Prioritize the following remaining improvements:
+
+1. **Record per-expert diagnostics.** Current rows aggregate active experts. Add expert start/end, normalized expert probability, projected gradient, Hessian scales, step size, and objective change per expert so one expert cannot hide another's behavior.
+
+2. **Fix final-row diagnostics.** The last row can report zero active experts because retirement is evaluated after the final return. Capture the experts that processed the final return before advancing the diagnostic time index.
+
+3. **Increase output precision.** `weights.csv` currently rounds weights to six decimal places. Use at least 12 significant digits so small but real allocations and turnover are visible.
+
+4. **Audit barrier and curvature sensitivity.** Add configurable barrier strength and curvature decay or reset experiments. Compare projected gradients, Hessian scales, turnover, and wealth across settings rather than changing gamma alone.
+
+5. **Separate objective components.** Export barrier, linear-loss, quadratic, offset, and total objective contributions. This will make cancellation and excessive curvature visible.
+
+6. **Add dense/top-k/cost comparison reports.** Run dense, top-k, and transaction-cost variants from the same return stream and report wealth, turnover, volatility, Sharpe, and drawdown side by side.
+
+7. **Use walk-forward validation.** Select gamma, barrier strength, beta, momentum, top-k, and transaction cost assumptions on a validation period, then report results on a later untouched test period. The hindsight single-asset comparator should remain clearly labeled as an oracle.
+
+8. **Improve data audit visibility.** Include the preprocessing audit counters in the run summary and fail or warn when forward filling, neutral replacements, or return clamping exceeds configured thresholds.
+
+9. **Benchmark scaling.** Measure runtime and allocations as dimension, horizon, and active-expert count grow. Reuse matrices and reduce temporary slice allocation only after profiling.
+
+10. **Document approximation boundaries.** Keep the README and review explicit that the barrier recursion, sleeping-expert schedule, momentum, top-k execution, and practical Newton safeguards are approximations or strategy overlays rather than literal paper equations.
