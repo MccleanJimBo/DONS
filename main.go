@@ -29,12 +29,24 @@ const (
 // ─────────────────────────────────────────────
 // Expert struct
 // ─────────────────────────────────────────────
+type ExpertState int
+
+const (
+	ExpertSleeping ExpertState = iota
+	ExpertActive
+	ExpertRetired
+)
+
 type Expert struct {
-	dons      *DONS
-	start     int
-	end       int
-	logWeight float64
-	portfolio []float64
+	dons              *DONS
+	start             int
+	end               int
+	localHorizon      int
+	state             ExpertState
+	priorLogWeight    float64
+	logWeight         float64
+	portfolio         []float64
+	numericalFailures int
 }
 
 type MetaDONS struct {
@@ -44,6 +56,7 @@ type MetaDONS struct {
 	gamma    float64
 	momentum float64
 	experts  []*Expert
+	retired  int
 }
 
 // ─────────────────────────────────────────────
@@ -87,19 +100,24 @@ func (b *BarrierState) nt(T float64, n float64) []float64 {
 }
 
 type DONS struct {
-	d          int
-	n          float64
-	beta       float64
-	gamma      float64
-	momentum   float64
-	epsilon    float64
-	w          []float64
-	p          []float64
-	barrier    *BarrierState
-	quadHess   *mat.Dense
-	quadOffset []float64
-	last       []float64
-	pending    []float64
+	d                         int
+	n                         float64
+	beta                      float64
+	gamma                     float64
+	momentum                  float64
+	epsilon                   float64
+	w                         []float64
+	p                         []float64
+	barrier                   *BarrierState
+	quadHess                  *mat.Dense
+	quadOffset                []float64
+	last                      []float64
+	pending                   []float64
+	lastNewtonDecrement       float64
+	lastKKTResidual           float64
+	lastConstraintResidual    float64
+	lastHessianRegularization float64
+	lastNewtonAccepted        bool
 }
 
 func NewMetaDONS(d, T int, eta float64) *MetaDONS {
@@ -152,21 +170,38 @@ func NewDONS(d int, n, beta float64) *DONS {
 	}
 }
 
+func (m *MetaDONS) newExpert(start, end int) *Expert {
+	localHorizon := maxInt(1, end-start)
+	priorLogWeight := -math.Log(float64(localHorizon))
+	dons := NewDONS(m.d, NStock, BetaStock)
+	dons.gamma = m.gamma
+	dons.momentum = m.momentum
+	return &Expert{
+		dons:           dons,
+		start:          start,
+		end:            end,
+		localHorizon:   localHorizon,
+		state:          ExpertSleeping,
+		priorLogWeight: priorLogWeight,
+		logWeight:      priorLogWeight,
+	}
+}
+
+func (m *MetaDONS) intervalEnd(start int) int {
+	if start == 0 {
+		return minInt(m.T, 2)
+	}
+	return minInt(m.T, 3*start)
+}
+
 func (m *MetaDONS) ensureExperts(t int) {
 	seen := make(map[int]bool, len(m.experts))
 	for _, e := range m.experts {
 		seen[e.start] = true
 	}
 
-	if !seen[0] {
-		e := &Expert{
-			dons:      NewDONS(m.d, NStock, BetaStock),
-			start:     0,
-			end:       minInt(m.T, 2),
-			logWeight: 0,
-		}
-		e.dons.gamma = m.gamma
-		e.dons.momentum = m.momentum
+	if !seen[0] && m.intervalEnd(0) > t {
+		e := m.newExpert(0, m.intervalEnd(0))
 		m.experts = append(m.experts, e)
 		seen[0] = true
 	}
@@ -175,15 +210,10 @@ func (m *MetaDONS) ensureExperts(t int) {
 		if seen[start] {
 			continue
 		}
-		end := minInt(m.T, 3*start)
-		e := &Expert{
-			dons:      NewDONS(m.d, NStock, BetaStock),
-			start:     start,
-			end:       end,
-			logWeight: 0,
+		e := m.newExpert(start, m.intervalEnd(start))
+		if e.end <= t {
+			continue
 		}
-		e.dons.gamma = m.gamma
-		e.dons.momentum = m.momentum
 		m.experts = append(m.experts, e)
 		seen[start] = true
 	}
@@ -195,6 +225,13 @@ func (m *MetaDONS) ensureExperts(t int) {
 
 func minInt(a, b int) int {
 	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
 		return a
 	}
 	return b
@@ -336,7 +373,7 @@ func (m *MetaDONS) Predict(t int) []float64 {
 	w := make([]float64, m.d)
 	logZ := math.Inf(-1)
 	for _, e := range active {
-		e.portfolio = e.dons.Predict(m.T)
+		e.portfolio = e.dons.Predict(e.localHorizon)
 		logZ = logAdd(logZ, e.logWeight)
 	}
 	for _, e := range active {
@@ -366,13 +403,14 @@ func (m *MetaDONS) Update(r []float64, t int) {
 		}
 		value := dot(r, e.portfolio)
 		if value <= 0 || !isFinite(value) {
-			value = 1e-12
+			e.numericalFailures++
+			continue
 		}
 		// Expert weight update in the paper's notation:
 		//   log w_{t+1}(E) = log w_t(E) - eta * ell_t(u_t^E)
 		// with ell_t(u) = -log <r_t, u>.
 		e.logWeight -= m.eta * (-math.Log(value))
-		e.dons.Update(r, m.T)
+		e.dons.Update(r, e.localHorizon)
 	}
 }
 
@@ -380,6 +418,8 @@ func (m *MetaDONS) retireExpiredExperts(t int) {
 	kept := m.experts[:0]
 	for _, e := range m.experts {
 		if e.end <= t {
+			e.state = ExpertRetired
+			m.retired++
 			continue
 		}
 		kept = append(kept, e)
@@ -390,8 +430,14 @@ func (m *MetaDONS) retireExpiredExperts(t int) {
 func (m *MetaDONS) activeExperts(t int) []*Expert {
 	active := make([]*Expert, 0, len(m.experts))
 	for _, e := range m.experts {
+		if e.state == ExpertRetired {
+			continue
+		}
 		if e.start <= t && t < e.end {
+			e.state = ExpertActive
 			active = append(active, e)
+		} else {
+			e.state = ExpertSleeping
 		}
 	}
 	return active
@@ -474,7 +520,13 @@ func smoothed(w []float64, d, T int) []float64 {
 	return result
 }
 
-func solveConstrainedNewton(H *mat.Dense, grad []float64) ([]float64, error) {
+type newtonSolveResult struct {
+	delta              []float64
+	kktResidual        float64
+	constraintResidual float64
+}
+
+func solveConstrainedNewtonDetailed(H *mat.Dense, grad []float64) (newtonSolveResult, error) {
 	d := H.RawMatrix().Cols
 	kkt := mat.NewDense(d+1, d+1, nil)
 	for i := 0; i < d; i++ {
@@ -492,17 +544,119 @@ func solveConstrainedNewton(H *mat.Dense, grad []float64) ([]float64, error) {
 
 	var solution mat.VecDense
 	if err := solution.SolveVec(kkt, rhs); err != nil {
-		return nil, err
+		return newtonSolveResult{}, err
 	}
 
 	delta := make([]float64, d)
 	for i := range delta {
 		delta[i] = solution.AtVec(i)
 	}
-	return delta, nil
+
+	residual := make([]float64, d+1)
+	for i := 0; i < d; i++ {
+		value := grad[i] + solution.AtVec(d)
+		for j := 0; j < d; j++ {
+			value += H.At(i, j) * delta[j]
+		}
+		residual[i] = value
+	}
+	residual[d] = sum(delta)
+
+	return newtonSolveResult{
+		delta:              delta,
+		kktResidual:        vectorNorm(residual[:d]),
+		constraintResidual: math.Abs(residual[d]),
+	}, nil
+}
+
+func solveConstrainedNewton(H *mat.Dense, grad []float64) ([]float64, error) {
+	result, err := solveConstrainedNewtonDetailed(H, grad)
+	if err != nil {
+		return nil, err
+	}
+	return result.delta, nil
+}
+
+func vectorNorm(values []float64) float64 {
+	norm := 0.0
+	for _, value := range values {
+		norm += value * value
+	}
+	return math.Sqrt(norm)
+}
+
+func (d *DONS) stabilizedQuadraticHessian() (*mat.Dense, float64) {
+	q := mat.NewDense(d.d, d.d, nil)
+	maxDiag := 0.0
+	minDiag := math.Inf(1)
+	minGershgorin := math.Inf(1)
+	invalid := false
+
+	for i := 0; i < d.d; i++ {
+		rowSum := 0.0
+		for j := 0; j < d.d; j++ {
+			value := 0.5 * (d.quadHess.At(i, j) + d.quadHess.At(j, i))
+			if !isFinite(value) {
+				invalid = true
+			}
+			q.Set(i, j, value)
+			if i != j {
+				rowSum += math.Abs(value)
+			}
+		}
+		diagonal := q.At(i, i)
+		if !isFinite(diagonal) || diagonal < 0 {
+			invalid = true
+		}
+		maxDiag = math.Max(maxDiag, diagonal)
+		minDiag = math.Min(minDiag, diagonal)
+		minGershgorin = math.Min(minGershgorin, diagonal-rowSum)
+	}
+
+	if invalid {
+		d.quadHess = mat.NewDense(d.d, d.d, nil)
+		d.quadOffset = make([]float64, d.d)
+		return d.quadHess, 0
+	}
+
+	regularization := 0.0
+	if maxDiag > 0 && (minDiag <= 0 || maxDiag/minDiag > 1e10) {
+		regularization = math.Max(1e-10, maxDiag*1e-8)
+	}
+	if minGershgorin <= 0 {
+		regularization = math.Max(regularization, -minGershgorin+1e-10)
+	}
+	if regularization > 0 {
+		for i := 0; i < d.d; i++ {
+			d.quadHess.Set(i, i, d.quadHess.At(i, i)+regularization)
+			q.Set(i, i, q.At(i, i)+regularization)
+		}
+	}
+	return q, regularization
+}
+
+func quadraticObjective(w, nt []float64, q *mat.Dense, offset []float64) float64 {
+	value := 0.0
+	for i := range w {
+		if w[i] <= 0 || !isFinite(w[i]) {
+			return math.Inf(1)
+		}
+		value -= nt[i] * math.Log(w[i])
+		value += offset[i] * w[i]
+		for j := range w {
+			value += 0.5 * w[i] * q.At(i, j) * w[j]
+		}
+	}
+	return value
 }
 
 func (d *DONS) Update(r []float64, T int) {
+	d.lastNewtonDecrement = 0
+	d.lastKKTResidual = math.Inf(1)
+	d.lastConstraintResidual = math.Inf(1)
+	d.lastHessianRegularization = 0
+	d.lastNewtonAccepted = false
+
 	u := d.pending
 	if u == nil {
 		u = d.Predict(T)
@@ -511,10 +665,12 @@ func (d *DONS) Update(r []float64, T int) {
 	addQuadraticTerm(d, g, d.w)
 	d.updateP(u)
 	nt := d.computeNt(float64(T))
+	q, regularization := d.stabilizedQuadraticHessian()
+	d.lastHessianRegularization = regularization
 	grad := barrierGrad(d.w, nt)
 	for i := range grad {
 		for j := 0; j < d.d; j++ {
-			grad[i] += d.quadHess.At(i, j) * d.w[j]
+			grad[i] += q.At(i, j) * d.w[j]
 		}
 		grad[i] += d.quadOffset[i]
 	}
@@ -523,23 +679,48 @@ func (d *DONS) Update(r []float64, T int) {
 	// This is kept structurally close to the paper's damped-update form, while remaining
 	// numerically stable in a practical simplex implementation.
 	H := mat.NewDense(d.d, d.d, nil)
+	barrierH := barrierHessian(d.w, nt)
 	for i := 0; i < d.d; i++ {
 		for j := 0; j < d.d; j++ {
-			H.Set(i, j, barrierHessian(d.w, nt)[i][j]+d.quadHess.At(i, j))
+			H.Set(i, j, barrierH[i][j]+q.At(i, j))
 		}
 	}
 
-	delta, err := solveConstrainedNewton(H, grad)
+	result, err := solveConstrainedNewtonDetailed(H, grad)
+	for attempt := 0; err != nil && attempt < 3; attempt++ {
+		ridge := math.Max(1e-8, math.Pow10(attempt)*1e-6)
+		for i := 0; i < d.d; i++ {
+			d.quadHess.Set(i, i, d.quadHess.At(i, i)+ridge)
+			q.Set(i, i, q.At(i, i)+ridge)
+			H.Set(i, i, H.At(i, i)+ridge)
+		}
+		d.lastHessianRegularization += ridge
+		result, err = solveConstrainedNewtonDetailed(H, grad)
+	}
 	if err != nil {
 		return
 	}
-	decrement := math.Max(0, dot(grad, delta))
+	d.lastKKTResidual = result.kktResidual
+	d.lastConstraintResidual = result.constraintResidual
+	decrement := math.Max(0, -dot(grad, result.delta))
+	d.lastNewtonDecrement = decrement
 	den := 1 + 4*math.Sqrt(decrement)
-	next := make([]float64, d.d)
-	for i := range next {
-		next[i] = d.w[i] + d.gamma*delta[i]/den
+	step := d.gamma / den
+	oldObjective := quadraticObjective(d.w, nt, q, d.quadOffset)
+	for attempt := 0; attempt < 12; attempt++ {
+		next := make([]float64, d.d)
+		for i := range next {
+			next[i] = d.w[i] + step*result.delta[i]
+		}
+		next = projectInterior(next, d.epsilon)
+		newObjective := quadraticObjective(next, nt, q, d.quadOffset)
+		if isFinite(newObjective) && newObjective <= oldObjective+1e-12*(1+math.Abs(oldObjective)) {
+			d.w = next
+			d.lastNewtonAccepted = true
+			return
+		}
+		step *= 0.5
 	}
-	d.w = projectInterior(next, d.epsilon)
 }
 
 // ─────────────────────────────────────────────

@@ -86,8 +86,8 @@ func TestMetaPredictionNormalizes(t *testing.T) {
 func TestMetaUsesOverlappingGeometricIntervals(t *testing.T) {
 	meta := NewMetaDONS(3, 16, EtaStock)
 	meta.Predict(2)
-	if len(meta.experts) != 3 {
-		t.Fatalf("expected experts at starts 0, 1, and 2, got %d", len(meta.experts))
+	if len(meta.experts) != 2 {
+		t.Fatalf("expected active-lifetime experts at starts 1 and 2, got %d", len(meta.experts))
 	}
 	active := meta.activeExperts(2)
 	if len(active) != 2 {
@@ -96,6 +96,29 @@ func TestMetaUsesOverlappingGeometricIntervals(t *testing.T) {
 	for _, expert := range active {
 		if expert.start > 2 || expert.end <= 2 {
 			t.Fatalf("expert interval [%d, %d) does not cover t=2", expert.start, expert.end)
+		}
+	}
+}
+
+func TestMetaExpertLifecycleAndLocalHorizon(t *testing.T) {
+	meta := NewMetaDONS(3, 16, EtaStock)
+	meta.Predict(0)
+	if len(meta.experts) != 1 || meta.experts[0].state != ExpertActive {
+		t.Fatalf("expected initial expert to be active: %+v", meta.experts)
+	}
+	if meta.experts[0].localHorizon != 2 {
+		t.Fatalf("unexpected initial expert horizon: %d", meta.experts[0].localHorizon)
+	}
+	meta.Predict(2)
+	if meta.retired != 1 {
+		t.Fatalf("expected one retired expert at t=2, got %d", meta.retired)
+	}
+	for _, expert := range meta.activeExperts(2) {
+		if expert.state != ExpertActive || expert.localHorizon != expert.end-expert.start {
+			t.Fatalf("invalid active expert lifecycle: %+v", expert)
+		}
+		if !isFinite(expert.priorLogWeight) || !isFinite(expert.logWeight) {
+			t.Fatalf("invalid expert prior: %+v", expert)
 		}
 	}
 }
@@ -138,6 +161,38 @@ func TestSolveConstrainedNewtonRespectsSimplexConstraint(t *testing.T) {
 		if !isFinite(delta[i]) {
 			t.Fatalf("non-finite Newton step component %d: %v", i, delta[i])
 		}
+	}
+}
+
+func TestConstrainedNewtonReportsResiduals(t *testing.T) {
+	H := mat.NewDense(2, 2, []float64{
+		2, 0,
+		0, 3,
+	})
+	result, err := solveConstrainedNewtonDetailed(H, []float64{1, -1})
+	if err != nil {
+		t.Fatalf("solveConstrainedNewtonDetailed returned error: %v", err)
+	}
+	if result.kktResidual > 1e-10 {
+		t.Fatalf("KKT residual is too large: %v", result.kktResidual)
+	}
+	if result.constraintResidual > 1e-10 {
+		t.Fatalf("constraint residual is too large: %v", result.constraintResidual)
+	}
+}
+
+func TestDONSUpdateTracksNewtonDiagnostics(t *testing.T) {
+	dons := NewDONS(3, NStock, BetaStock)
+	dons.Predict(10)
+	dons.Update([]float64{1.1, 0.95, 1.02}, 10)
+	if !isFinite(dons.lastNewtonDecrement) || dons.lastNewtonDecrement < 0 {
+		t.Fatalf("invalid Newton decrement: %v", dons.lastNewtonDecrement)
+	}
+	if !isFinite(dons.lastKKTResidual) || !isFinite(dons.lastConstraintResidual) {
+		t.Fatalf("invalid Newton residuals: KKT=%v constraint=%v", dons.lastKKTResidual, dons.lastConstraintResidual)
+	}
+	if !isFinite(dons.lastHessianRegularization) || dons.lastHessianRegularization < 0 {
+		t.Fatalf("invalid Hessian regularization: %v", dons.lastHessianRegularization)
 	}
 }
 
