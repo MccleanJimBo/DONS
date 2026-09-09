@@ -34,6 +34,28 @@ func TestProjectInterior(t *testing.T) {
 	}
 }
 
+func TestExecutionMode(t *testing.T) {
+	portfolio := []float64{0.5, 0.3, 0.2}
+	if got := dot(topK(portfolio, 2), []float64{1, 1, 1}); math.Abs(got-1) > 1e-12 {
+		t.Fatalf("top-k portfolio is not normalized: %v", got)
+	}
+	if got := dot(portfolio, []float64{1, 1, 1}); math.Abs(got-1) > 1e-12 {
+		t.Fatalf("dense portfolio changed unexpectedly: %v", got)
+	}
+}
+
+func TestDONSParametersPropagateToExperts(t *testing.T) {
+	meta := NewMetaDONS(2, 8, EtaStock)
+	meta.SetDONSParameters(1.5, 0.1)
+	meta.Predict(0)
+	if len(meta.experts) != 1 {
+		t.Fatal("expected one initial expert")
+	}
+	if meta.experts[0].dons.gamma != 1.5 || meta.experts[0].dons.momentum != 0.1 {
+		t.Fatalf("parameters did not propagate: gamma=%v momentum=%v", meta.experts[0].dons.gamma, meta.experts[0].dons.momentum)
+	}
+}
+
 func TestDONSUpdateIsCausal(t *testing.T) {
 	dons := NewDONS(2, NStock, BetaStock)
 	predicted := dons.Predict(10)
@@ -56,5 +78,39 @@ func TestMetaPredictionNormalizes(t *testing.T) {
 	meta.Update([]float64{1.1, 0.95, 1.02}, 0)
 	if len(meta.experts) == 0 {
 		t.Fatal("meta did not create an expert")
+	}
+}
+
+func TestMetaUsesOverlappingGeometricIntervals(t *testing.T) {
+	meta := NewMetaDONS(3, 16, EtaStock)
+	meta.Predict(2)
+	if len(meta.experts) != 3 {
+		t.Fatalf("expected experts at starts 0, 1, and 2, got %d", len(meta.experts))
+	}
+	active := meta.activeExperts(2)
+	if len(active) != 2 {
+		t.Fatalf("expected two active overlapping experts at t=2, got %d", len(active))
+	}
+	for _, expert := range active {
+		if expert.start > 2 || expert.end <= 2 {
+			t.Fatalf("expert interval [%d, %d) does not cover t=2", expert.start, expert.end)
+		}
+	}
+}
+
+func TestBarrierAdaptsAndStaysFinite(t *testing.T) {
+	dons := NewDONS(3, NStock, BetaStock)
+	initial := append([]float64(nil), dons.p...)
+	dons.updateP([]float64{0.8, 0.1, 0.1})
+	if dons.p[0] <= initial[0] {
+		t.Fatalf("barrier coordinate did not adapt: before %v, after %v", initial[0], dons.p[0])
+	}
+	nt := dons.computeNt(100)
+	gradient := barrierGrad([]float64{0.8, 0.1, 0.1}, nt)
+	hessian := barrierHessian([]float64{0.8, 0.1, 0.1}, nt)
+	for i := range gradient {
+		if !isFinite(nt[i]) || !isFinite(gradient[i]) || !isFinite(hessian[i][i]) || hessian[i][i] <= 0 {
+			t.Fatalf("invalid barrier derivative at %d: nt=%v gradient=%v hessian=%v", i, nt[i], gradient[i], hessian[i][i])
+		}
 	}
 }

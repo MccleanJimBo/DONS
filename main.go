@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"flag"
 	"fmt"
 	"log"
 	"math"
@@ -37,10 +38,12 @@ type Expert struct {
 }
 
 type MetaDONS struct {
-	d       int
-	T       int
-	eta     float64
-	experts []*Expert
+	d        int
+	T        int
+	eta      float64
+	gamma    float64
+	momentum float64
+	experts  []*Expert
 }
 
 // ─────────────────────────────────────────────
@@ -63,11 +66,18 @@ type DONS struct {
 
 func NewMetaDONS(d, T int, eta float64) *MetaDONS {
 	return &MetaDONS{
-		d:       d,
-		T:       T,
-		eta:     eta,
-		experts: []*Expert{},
+		d:        d,
+		T:        T,
+		eta:      eta,
+		gamma:    3.0,
+		momentum: 0.0,
+		experts:  []*Expert{},
 	}
+}
+
+func (m *MetaDONS) SetDONSParameters(gamma, momentum float64) {
+	m.gamma = gamma
+	m.momentum = momentum
 }
 
 // ─────────────────────────────────────────────
@@ -100,27 +110,39 @@ func NewDONS(d int, n, beta float64) *DONS {
 
 func (m *MetaDONS) ensureExperts(t int) {
 	if len(m.experts) == 0 {
-		// first expert at t=0
 		e := &Expert{
 			dons:      NewDONS(m.d, NStock, BetaStock),
-			start:     t,
-			end:       m.T,
+			start:     0,
+			end:       minInt(m.T, 2),
 			logWeight: 0,
 		}
+		e.dons.gamma = m.gamma
+		e.dons.momentum = m.momentum
 		m.experts = append(m.experts, e)
-		return
 	}
 
-	// geometric schedule based on number of experts
-	if len(m.experts) < 20 { // cap to avoid explosion
-		if t == 1<<len(m.experts) {
+	for start := 1; start <= t && start < m.T; start *= 2 {
+		known := false
+		for _, e := range m.experts {
+			if e.start == start {
+				known = true
+				break
+			}
+		}
+		if !known {
 			e := &Expert{
 				dons:      NewDONS(m.d, NStock, BetaStock),
 				start:     t,
-				end:       minInt(m.T, t+(1<<len(m.experts))),
+				end:       minInt(m.T, start+2*start),
 				logWeight: 0,
 			}
+			e.dons.gamma = m.gamma
+			e.dons.momentum = m.momentum
+			e.start = start
 			m.experts = append(m.experts, e)
+		}
+		if start > m.T/2 {
+			break
 		}
 	}
 }
@@ -732,6 +754,7 @@ func runTest(
 	uSPY []float64,
 	uBest []float64,
 	meta *MetaDONS,
+	executionK int,
 ) (
 	[]float64,
 	[]float64,
@@ -809,15 +832,17 @@ func runTest(
 			})
 
 		}
-		iter++
-
-		// DAILY COMPOUNDING
-		// Sparse execution is an explicit strategy overlay; the learner remains dense.
-		retAlgo := dotSafe(rToday, topK(w, 3))
+		// DAILY COMPOUNDING. Zero means execute the dense learner output.
+		executed := w
+		if executionK > 0 {
+			executed = topK(w, executionK)
+		}
+		retAlgo := dotSafe(rToday, executed)
 
 		retSPY := dotSafe(rToday, uSPY)
 		retBest := dotSafe(rToday, uBest)
 		meta.Update(rToday, iter)
+		iter++
 		// guard
 		if retAlgo <= 0 || math.IsNaN(retAlgo) || math.IsInf(retAlgo, 0) {
 			retAlgo = 1.0
@@ -885,6 +910,19 @@ func dotSafe(r, w []float64) float64 {
 }
 
 func main() {
+	executionK := flag.Int("top-k", 0, "execute only the top K assets; 0 keeps the dense portfolio")
+	gamma := flag.Float64("gamma", 3.0, "Newton damping multiplier")
+	momentum := flag.Float64("momentum", 0.0, "heuristic momentum overlay; 0 disables it")
+	flag.Parse()
+	if *executionK < 0 {
+		log.Fatal("top-k must be non-negative")
+	}
+	if *gamma <= 0 {
+		log.Fatal("gamma must be positive")
+	}
+	if *momentum < 0 || *momentum >= 1 {
+		log.Fatal("momentum must be at least 0 and less than 1")
+	}
 
 	// --- Load universe ---
 	universe, err := data.LoadUniverse()
@@ -928,6 +966,7 @@ func main() {
 	eta := 0.15
 
 	meta := NewMetaDONS(d, Ttest, eta)
+	meta.SetDONSParameters(*gamma, *momentum)
 
 	// --- Comparator vectors ---
 	uSPY := comparatorSPY(universe)
@@ -944,6 +983,7 @@ func main() {
 			uSPY,
 			uBest,
 			meta,
+			*executionK,
 		)
 
 	// --- Print summary ---
