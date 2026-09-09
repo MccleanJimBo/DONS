@@ -3,6 +3,8 @@ package main
 import (
 	"math"
 	"testing"
+
+	"gonum.org/v1/gonum/mat"
 )
 
 func TestCoverGradientMatchesLogLoss(t *testing.T) {
@@ -112,5 +114,44 @@ func TestBarrierAdaptsAndStaysFinite(t *testing.T) {
 		if !isFinite(nt[i]) || !isFinite(gradient[i]) || !isFinite(hessian[i][i]) || hessian[i][i] <= 0 {
 			t.Fatalf("invalid barrier derivative at %d: nt=%v gradient=%v hessian=%v", i, nt[i], gradient[i], hessian[i][i])
 		}
+	}
+}
+
+func TestSolveConstrainedNewtonRespectsSimplexConstraint(t *testing.T) {
+	H := mat.NewDense(3, 3, []float64{
+		2, 0, 0,
+		0, 3, 0,
+		0, 0, 4,
+	})
+	grad := []float64{1, -1, 0}
+	delta, err := solveConstrainedNewton(H, grad)
+	if err != nil {
+		t.Fatalf("solveConstrainedNewton returned error: %v", err)
+	}
+	if len(delta) != 3 {
+		t.Fatalf("unexpected delta length: %d", len(delta))
+	}
+	if math.Abs(sum(delta)) > 1e-8 {
+		t.Fatalf("constrained Newton step violates simplex feasibility: sum(delta)=%v", sum(delta))
+	}
+	for i := range delta {
+		if !isFinite(delta[i]) {
+			t.Fatalf("non-finite Newton step component %d: %v", i, delta[i])
+		}
+	}
+}
+
+func TestMetaRetiresExpiredExperts(t *testing.T) {
+	meta := NewMetaDONS(3, 16, EtaStock)
+	meta.ensureExperts(8)
+	if len(meta.experts) == 0 {
+		t.Fatal("expected experts to be created")
+	}
+	for _, e := range meta.experts {
+		e.end = 8
+	}
+	meta.retireExpiredExperts(8)
+	if len(meta.experts) != 0 {
+		t.Fatalf("expected all expired experts to be retired, but kept %d", len(meta.experts))
 	}
 }
