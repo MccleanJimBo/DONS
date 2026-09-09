@@ -29,10 +29,11 @@ const (
 // Expert struct
 // ─────────────────────────────────────────────
 type Expert struct {
-	dons   *DONS
-	start  int
-	weight float64
-	T      int
+	dons      *DONS
+	start     int
+	end       int
+	logWeight float64
+	portfolio []float64
 }
 
 type MetaDONS struct {
@@ -46,14 +47,18 @@ type MetaDONS struct {
 // DONS struct
 // ─────────────────────────────────────────────
 type DONS struct {
-	d         int
-	n         float64
-	beta      float64
-	w         [][]float64 // weight history
-	p         []float64   // barrier parameter vector
-	G         []float64   // gradient accumulator
-	gsHistory [][]float64 // gradient history
-	wsHistory [][]float64 // weight history for quadratic term
+	d          int
+	n          float64
+	beta       float64
+	gamma      float64
+	momentum   float64
+	epsilon    float64
+	w          []float64
+	p          []float64
+	quadHess   *mat.Dense
+	quadOffset []float64
+	last       []float64
+	pending    []float64
 }
 
 func NewMetaDONS(d, T int, eta float64) *MetaDONS {
@@ -76,18 +81,20 @@ func NewDONS(d int, n, beta float64) *DONS {
 
 	p0 := make([]float64, d)
 	for i := range p0 {
-		p0[i] = float64(d)
+		p0[i] = 1.0 / float64(d)
 	}
 
 	return &DONS{
-		d:         d,
-		n:         n,
-		beta:      beta,
-		w:         [][]float64{w1},
-		p:         p0,
-		G:         make([]float64, d),
-		gsHistory: [][]float64{},
-		wsHistory: [][]float64{},
+		d:          d,
+		n:          n,
+		beta:       beta,
+		gamma:      3.0,
+		momentum:   0.0,
+		epsilon:    1e-9,
+		w:          w1,
+		p:          p0,
+		quadHess:   mat.NewDense(d, d, nil),
+		quadOffset: make([]float64, d),
 	}
 }
 
@@ -95,10 +102,10 @@ func (m *MetaDONS) ensureExperts(t int) {
 	if len(m.experts) == 0 {
 		// first expert at t=0
 		e := &Expert{
-			dons:   NewDONS(m.d, NStock, BetaStock),
-			start:  t,
-			weight: 1.0,
-			T:      m.T,
+			dons:      NewDONS(m.d, NStock, BetaStock),
+			start:     t,
+			end:       m.T,
+			logWeight: 0,
 		}
 		m.experts = append(m.experts, e)
 		return
@@ -108,14 +115,21 @@ func (m *MetaDONS) ensureExperts(t int) {
 	if len(m.experts) < 20 { // cap to avoid explosion
 		if t == 1<<len(m.experts) {
 			e := &Expert{
-				dons:   NewDONS(m.d, NStock, BetaStock),
-				start:  t,
-				weight: 1.0,
-				T:      m.T,
+				dons:      NewDONS(m.d, NStock, BetaStock),
+				start:     t,
+				end:       minInt(m.T, t+(1<<len(m.experts))),
+				logWeight: 0,
 			}
 			m.experts = append(m.experts, e)
 		}
 	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ─────────────────────────────────────────────
@@ -201,6 +215,21 @@ func projectSimplex(v []float64) []float64 {
 	return w
 }
 
+func projectInterior(v []float64, epsilon float64) []float64 {
+	if epsilon*float64(len(v)) >= 1 {
+		epsilon = 1 / (2 * float64(len(v)))
+	}
+	shifted := make([]float64, len(v))
+	for i, value := range v {
+		shifted[i] = value - epsilon
+	}
+	projected := projectSimplex(shifted)
+	for i := range projected {
+		projected[i] = epsilon + (1-float64(len(v))*epsilon)*projected[i]
+	}
+	return projected
+}
+
 // ─────────────────────────────────────────────
 // Cover gradient
 // ─────────────────────────────────────────────
@@ -209,7 +238,7 @@ func coverGradient(r, u []float64) []float64 {
 	den := dot(r, u)
 	g := make([]float64, len(r))
 	for i := range r {
-		g[i] = r[i] / den
+		g[i] = -r[i] / den
 	}
 	return g
 }
@@ -235,80 +264,68 @@ func barrierHessian(u, nt []float64) [][]float64 {
 	return H
 }
 
-func quadraticGrad(u []float64, gsHistory [][]float64, wsHistory [][]float64, beta float64) []float64 {
-	d := len(u)
-	grad := make([]float64, d)
-	for s := range gsHistory {
-		gs := gsHistory[s]
-		ws := wsHistory[s]
-		diff := sub(u, ws)
-		inner := dot(gs, diff)
-		for i := 0; i < d; i++ {
-			grad[i] += (beta / 4.0) * inner * gs[i]
+func addQuadraticTerm(dons *DONS, g, w []float64) {
+	for i := 0; i < dons.d; i++ {
+		anchor := 0.0
+		for j := 0; j < dons.d; j++ {
+			coefficient := (dons.beta / 4.0) * g[i] * g[j]
+			dons.quadHess.Set(i, j, dons.quadHess.At(i, j)+coefficient)
+			anchor += coefficient * w[j]
 		}
+		dons.quadOffset[i] -= anchor
 	}
-	return grad
 }
 
-func quadraticHessian(gsHistory [][]float64, beta float64, d int) [][]float64 {
-	H := make([][]float64, d)
-	for i := 0; i < d; i++ {
-		H[i] = make([]float64, d)
-	}
-	for s := range gsHistory {
-		gs := gsHistory[s]
-		for i := 0; i < d; i++ {
-			for j := 0; j < d; j++ {
-				H[i][j] += (beta / 4.0) * gs[i] * gs[j]
-			}
-		}
-	}
-	return H
-}
-
-func (m *MetaDONS) Step(r []float64, t int) []float64 {
+func (m *MetaDONS) Predict(t int) []float64 {
 	m.ensureExperts(t)
+	active := m.activeExperts(t)
+	w := make([]float64, m.d)
+	logZ := math.Inf(-1)
+	for _, e := range active {
+		e.portfolio = e.dons.Predict(m.T)
+		logZ = logAdd(logZ, e.logWeight)
+	}
+	for _, e := range active {
+		weight := math.Exp(e.logWeight - logZ)
+		w = add(w, scale(e.portfolio, weight))
+	}
+	return projectInterior(w, 1e-9)
+}
 
-	active := []*Expert{}
+func (m *MetaDONS) Update(r []float64, t int) {
+	for _, e := range m.activeExperts(t) {
+		value := dot(r, e.portfolio)
+		if value <= 0 || !isFinite(value) {
+			value = 1e-12
+		}
+		e.logWeight -= m.eta * (-math.Log(value))
+		e.dons.Update(r, m.T)
+	}
+}
+
+func (m *MetaDONS) activeExperts(t int) []*Expert {
+	active := make([]*Expert, 0, len(m.experts))
 	for _, e := range m.experts {
-		if e.start <= t {
+		if e.start <= t && t < e.end {
 			active = append(active, e)
 		}
 	}
+	return active
+}
 
-	portfolios := make([][]float64, len(active))
-	losses := make([]float64, len(active))
-
-	for i, e := range active {
-		uRaw := e.dons.Step(r, t, m.T)
-		u := projectSimplex(uRaw)
-		portfolios[i] = u
-
-		val := dot(r, u)
-		if val <= 0 {
-			losses[i] = 1000
-		} else {
-			losses[i] = -math.Log(val)
-		}
+func logAdd(a, b float64) float64 {
+	if math.IsInf(a, -1) {
+		return b
 	}
-
-	var Z float64
-	for i, e := range active {
-		e.weight *= math.Exp(-m.eta * losses[i])
-		Z += e.weight
+	if a < b {
+		a, b = b, a
 	}
-	for _, e := range active {
-		e.weight /= Z
-	}
-
-	w := make([]float64, m.d)
-	for i, e := range active {
-		w = add(w, scale(portfolios[i], e.weight))
-	}
-	wSparse := topK(w, 3)
-	return wSparse
+	return a + math.Log1p(math.Exp(b-a))
 }
 func topK(w []float64, K int) []float64 {
+	if K > len(w) {
+		K = len(w)
+	}
 	// Top‑K filtering
 	type pair struct {
 		idx int
@@ -347,95 +364,74 @@ func topK(w []float64, K int) []float64 {
 // DONS Step
 // ─────────────────────────────────────────────
 func (d *DONS) Step(r []float64, t, T int) []float64 {
-	wt := d.w[len(d.w)-1]
+	portfolio := d.Predict(T)
+	d.Update(r, T)
+	return portfolio
+}
 
-	u := make([]float64, d.d)
-	for i := range u {
-		u[i] = (1.0-1.0/float64(T))*wt[i] + 1.0/(float64(d.d)*float64(T))
-	}
-	// MOMENTUM BIAS
-	momentum := 0.10
-	if len(d.wsHistory) > 0 {
-		// PREVIOUS WEIGHT
-		wtPrev := d.wsHistory[len(d.wsHistory)-1]
-
-		for i := range u {
-			u[i] += momentum * (wt[i] - wtPrev[i])
+func (d *DONS) Predict(T int) []float64 {
+	base := append([]float64(nil), d.w...)
+	if d.momentum != 0 && d.last != nil {
+		for i := range base {
+			base[i] += d.momentum * (d.w[i] - d.last[i])
 		}
 	}
-	u = projectSimplex(u)
+	d.last = append([]float64(nil), d.w...)
+	d.pending = projectInterior(smoothed(base, d.d, T), d.epsilon)
+	return append([]float64(nil), d.pending...)
+}
+
+func smoothed(w []float64, d, T int) []float64 {
+	result := make([]float64, len(w))
+	for i := range w {
+		result[i] = (1-1/float64(T))*w[i] + 1/(float64(d)*float64(T))
+	}
+	return result
+}
+
+func (d *DONS) Update(r []float64, T int) {
+	u := d.pending
+	if u == nil {
+		u = d.Predict(T)
+	}
 	g := coverGradient(r, u)
-
-	d.gsHistory = append(d.gsHistory, g)
-	d.wsHistory = append(d.wsHistory, wt)
-
+	addQuadraticTerm(d, g, d.w)
 	d.updateP(u)
 	nt := d.computeNt(float64(T))
-
-	Vgrad := barrierGrad(wt, nt)
-	Vhess := barrierHessian(wt, nt)
-
-	Qgrad := quadraticGrad(wt, d.gsHistory, d.wsHistory, d.beta)
-	Qhess := quadraticHessian(d.gsHistory, d.beta, d.d)
-
-	totalGrad := add(Vgrad, Qgrad)
-
-	newtonDir := make([]float64, d.d)
-	H := mat.NewDense(d.d, d.d, nil)
+	grad := barrierGrad(d.w, nt)
+	for i := range grad {
+		for j := 0; j < d.d; j++ {
+			grad[i] += d.quadHess.At(i, j) * d.w[j]
+		}
+		grad[i] += d.quadOffset[i]
+	}
+	H := mat.NewDense(d.d+1, d.d+1, nil)
 	for i := 0; i < d.d; i++ {
 		for j := 0; j < d.d; j++ {
-			H.Set(i, j, Vhess[i][j]+Qhess[i][j])
+			H.Set(i, j, barrierHessian(d.w, nt)[i][j]+d.quadHess.At(i, j))
 		}
+		H.Set(i, d.d, 1)
+		H.Set(d.d, i, 1)
 	}
-
-	epsilon := 1e-6
-	for i := 0; i < d.d; i++ {
-		H.Set(i, i, H.At(i, i)+epsilon)
+	rhs := mat.NewVecDense(d.d+1, nil)
+	for i := range grad {
+		rhs.SetVec(i, -grad[i])
 	}
-
-	gradVec := mat.NewVecDense(d.d, totalGrad)
-
-	var Hinv mat.Dense
-	if err := Hinv.Inverse(H); err == nil {
-		HinvGrad := mat.NewVecDense(d.d, nil)
-		HinvGrad.MulVec(&Hinv, gradVec)
-		for i := 0; i < d.d; i++ {
-			newtonDir[i] = HinvGrad.AtVec(i)
-		}
-	} else {
-		for i := 0; i < d.d; i++ {
-			newtonDir[i] = totalGrad[i]
-		}
+	var solution mat.VecDense
+	if err := solution.SolveVec(H, rhs); err != nil {
+		return
 	}
-	gamma := 3.0
-	den := 1.0 + 4.0*math.Sqrt(dot(totalGrad, newtonDir))
-	step := scale(newtonDir, gamma/den)
-
-	wNext := make([]float64, d.d)
-	for i := range wNext {
-		wNext[i] = wt[i] - step[i]
+	newton := make([]float64, d.d)
+	for i := range newton {
+		newton[i] = solution.AtVec(i)
 	}
-
-	wNext = projectSimplex(wNext)
-
-	bad := false
-	for i := range wNext {
-		if math.IsNaN(wNext[i]) || math.IsInf(wNext[i], 0) {
-			bad = true
-			break
-		}
+	decrement := math.Max(0, dot(grad, newton))
+	den := 1 + 4*math.Sqrt(decrement)
+	next := make([]float64, d.d)
+	for i := range next {
+		next[i] = d.w[i] + d.gamma*solution.AtVec(i)/den
 	}
-
-	if bad {
-		wNext = make([]float64, d.d)
-		for i := range wNext {
-			wNext[i] = 1.0 / float64(d.d)
-		}
-	}
-
-	d.w = append(d.w, wNext)
-	return projectSimplex(wNext)
-
+	d.w = projectInterior(next, d.epsilon)
 }
 
 // ─────────────────────────────────────────────
@@ -774,8 +770,8 @@ func runTest(
 	for t := 1; t < T; t++ {
 		rToday := Rtest[t]
 
-		// DAILY expert update (DONS + MetaDONS)
-		w = meta.Step(rToday, iter)
+		// Select the portfolio before observing today's return.
+		w = meta.Predict(iter)
 		if datesTest[t-1].Month() != datesTest[t].Month() {
 			row := []string{
 				fmt.Sprintf("%d", t),
@@ -816,10 +812,12 @@ func runTest(
 		iter++
 
 		// DAILY COMPOUNDING
-		retAlgo := dotSafe(rToday, w)
+		// Sparse execution is an explicit strategy overlay; the learner remains dense.
+		retAlgo := dotSafe(rToday, topK(w, 3))
 
 		retSPY := dotSafe(rToday, uSPY)
 		retBest := dotSafe(rToday, uBest)
+		meta.Update(rToday, iter)
 		// guard
 		if retAlgo <= 0 || math.IsNaN(retAlgo) || math.IsInf(retAlgo, 0) {
 			retAlgo = 1.0
