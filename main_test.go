@@ -50,8 +50,18 @@ func TestProjectInterior(t *testing.T) {
 
 func TestExecutionMode(t *testing.T) {
 	portfolio := []float64{0.5, 0.3, 0.2}
-	if got := dot(topK(portfolio, 2), []float64{1, 1, 1}); math.Abs(got-1) > 1e-12 {
+	selected := topK(portfolio, 2)
+	if got := dot(selected, []float64{1, 1, 1}); math.Abs(got-1) > 1e-12 {
 		t.Fatalf("top-k portfolio is not normalized: %v", got)
+	}
+	positive := 0
+	for _, weight := range selected {
+		if weight > 0 {
+			positive++
+		}
+	}
+	if positive != 2 || selected[2] != 0 {
+		t.Fatalf("top-k portfolio did not keep exactly two assets: %v", selected)
 	}
 	if got := dot(portfolio, []float64{1, 1, 1}); math.Abs(got-1) > 1e-12 {
 		t.Fatalf("dense portfolio changed unexpectedly: %v", got)
@@ -108,8 +118,13 @@ func TestDONSParametersPropagateToExperts(t *testing.T) {
 
 func TestConfigValidatesAndPropagates(t *testing.T) {
 	config := DefaultConfig()
+	if config.BarrierStrength != 0.25 || config.CurvatureResetThreshold != 1e5 || config.QuadraticDecay != 0.99 || config.QuadraticUpdateScale != 1.0 {
+		t.Fatalf("unexpected optimizer defaults: barrier=%v curvature reset=%v quadratic decay=%v update scale=%v", config.BarrierStrength, config.CurvatureResetThreshold, config.QuadraticDecay, config.QuadraticUpdateScale)
+	}
 	config.BarrierStrength = 4
 	config.Beta = 0.25
+	config.QuadraticDecay = 0.9
+	config.QuadraticUpdateScale = 0.5
 	config.Eta = 0.2
 	config.Gamma = 1.5
 	config.Momentum = 0.1
@@ -123,13 +138,18 @@ func TestConfigValidatesAndPropagates(t *testing.T) {
 		t.Fatal("expected configured meta learner to create an expert")
 	}
 	expert := meta.experts[0]
-	if expert.dons.n != config.BarrierStrength || expert.dons.beta != config.Beta {
-		t.Fatalf("config did not reach expert: n=%v beta=%v", expert.dons.n, expert.dons.beta)
+	if expert.dons.n != config.BarrierStrength || expert.dons.beta != config.Beta || expert.dons.quadraticDecay != config.QuadraticDecay || expert.dons.quadraticUpdateScale != config.QuadraticUpdateScale {
+		t.Fatalf("config did not reach expert: n=%v beta=%v decay=%v scale=%v", expert.dons.n, expert.dons.beta, expert.dons.quadraticDecay, expert.dons.quadraticUpdateScale)
 	}
 	invalid := config
 	invalid.Gamma = 0
 	if err := invalid.Validate(); err == nil {
 		t.Fatal("expected zero gamma to be rejected")
+	}
+	invalid = config
+	invalid.QuadraticDecay = 0
+	if err := invalid.Validate(); err == nil {
+		t.Fatal("expected zero quadratic decay to be rejected")
 	}
 }
 
@@ -306,6 +326,44 @@ func TestDONSUpdateTracksNewtonDiagnostics(t *testing.T) {
 		t.Fatalf("invalid gradient/Hessian scales: gradient=%v projected=%v barrier=%v quadratic=%v combined=%v",
 			dons.lastGradientNorm, dons.lastProjectedGradientNorm, dons.lastBarrierHessianNorm,
 			dons.lastQuadraticHessianNorm, dons.lastCombinedHessianNorm)
+	}
+}
+
+func TestObjectiveComponentsSumToTotal(t *testing.T) {
+	w := []float64{0.5, 0.3, 0.2}
+	nt := []float64{2.0, 1.5, 1.0}
+	q := mat.NewDense(3, 3, []float64{
+		0.2, 0.02, 0.01,
+		0.02, 0.3, 0.01,
+		0.01, 0.01, 0.4,
+	})
+	linear := []float64{0.2, -0.3, 0.1}
+	offset := []float64{0.05, 0.1, -0.05}
+	obj := objectiveComponents(w, nt, q, offset, linear)
+	if !isFinite(obj.Barrier) || !isFinite(obj.LinearLoss) || !isFinite(obj.Quadratic) || !isFinite(obj.Offset) || !isFinite(obj.Total) {
+		t.Fatalf("objective components are not finite: %+v", obj)
+	}
+	if math.Abs(obj.Total-(obj.Barrier+obj.LinearLoss+obj.Quadratic+obj.Offset)) > 1e-8 {
+		t.Fatalf("objective decomposition does not sum to total: total=%v components=%+v", obj.Total, obj)
+	}
+}
+
+func TestDiagnosticsCaptureFinalRowExpertsBeforeAdvance(t *testing.T) {
+	meta := NewMetaDONS(3, 8, EtaStock)
+	meta.ensureExperts(2)
+	if len(meta.experts) == 0 {
+		t.Fatal("expected expert set to exist before meauring final-row diagnostics")
+	}
+	beforeLastUpdate := meta.activeExperts(2)
+	if len(beforeLastUpdate) == 0 {
+		t.Fatal("final-row expert snapshot was empty before the last update")
+	}
+	meta.Update([]float64{0.9, 1.1, 1.05}, 2)
+	if len(meta.activeExperts(2)) == 0 {
+		t.Fatal("final-row expert snapshot was lost after the last update")
+	}
+	if len(beforeLastUpdate) == 0 {
+		t.Fatal("final-row experts were not retained for the diagnostic row")
 	}
 }
 

@@ -28,24 +28,34 @@ const (
 )
 
 type Config struct {
-	BarrierStrength float64
-	Beta            float64
-	Eta             float64
-	Gamma           float64
-	Momentum        float64
-	TopK            int
-	TransactionCost float64
+	BarrierStrength         float64
+	BarrierDecay            float64
+	BarrierResetThreshold   float64
+	CurvatureResetThreshold float64
+	Beta                    float64
+	QuadraticDecay          float64
+	QuadraticUpdateScale    float64
+	Eta                     float64
+	Gamma                   float64
+	Momentum                float64
+	TopK                    int
+	TransactionCost         float64
 }
 
 func DefaultConfig() Config {
 	return Config{
-		BarrierStrength: NStock,
-		Beta:            BetaStock,
-		Eta:             EtaStock,
-		Gamma:           3.0,
-		Momentum:        0.0,
-		TopK:            0,
-		TransactionCost: 0.0,
+		BarrierStrength:         0.25,
+		BarrierDecay:            1.0,
+		BarrierResetThreshold:   1e-8,
+		CurvatureResetThreshold: 1e5,
+		Beta:                    BetaStock,
+		QuadraticDecay:          0.99,
+		QuadraticUpdateScale:    1.0,
+		Eta:                     EtaStock,
+		Gamma:                   3.0,
+		Momentum:                0.0,
+		TopK:                    0,
+		TransactionCost:         0.0,
 	}
 }
 
@@ -53,8 +63,23 @@ func (c Config) Validate() error {
 	if c.BarrierStrength <= 0 || !isFinite(c.BarrierStrength) {
 		return errors.New("barrier strength must be finite and positive")
 	}
+	if c.BarrierDecay <= 0 || c.BarrierDecay > 1 || !isFinite(c.BarrierDecay) {
+		return errors.New("barrier decay must be finite and in (0, 1]")
+	}
+	if c.BarrierResetThreshold < 0 || !isFinite(c.BarrierResetThreshold) {
+		return errors.New("barrier reset threshold must be finite and non-negative")
+	}
+	if c.CurvatureResetThreshold <= 0 || !isFinite(c.CurvatureResetThreshold) {
+		return errors.New("curvature reset threshold must be finite and positive")
+	}
 	if c.Beta < 0 || !isFinite(c.Beta) {
 		return errors.New("beta must be finite and non-negative")
+	}
+	if c.QuadraticDecay <= 0 || c.QuadraticDecay > 1 || !isFinite(c.QuadraticDecay) {
+		return errors.New("quadratic decay must be finite and in (0, 1]")
+	}
+	if c.QuadraticUpdateScale < 0 || !isFinite(c.QuadraticUpdateScale) {
+		return errors.New("quadratic update scale must be finite and non-negative")
 	}
 	if c.Eta < 0 || !isFinite(c.Eta) {
 		return errors.New("eta must be finite and non-negative")
@@ -151,38 +176,53 @@ func (b *BarrierState) nt(T float64, n float64) []float64 {
 }
 
 type DONS struct {
-	d                         int
-	n                         float64
-	beta                      float64
-	gamma                     float64
-	momentum                  float64
-	epsilon                   float64
-	w                         []float64
-	p                         []float64
-	barrier                   *BarrierState
-	quadHess                  *mat.Dense
-	quadOffset                []float64
-	last                      []float64
-	pending                   []float64
-	lastNewtonDecrement       float64
-	lastKKTResidual           float64
-	lastRelativeKKTResidual   float64
-	lastConstraintResidual    float64
-	lastHessianRegularization float64
-	lastNewtonAccepted        bool
-	lastRawStepNorm           float64
-	lastAcceptedStepNorm      float64
-	lastStepSize              float64
-	lastBacktrackingAttempts  int
-	lastObjectiveBefore       float64
-	lastObjectiveAfter        float64
-	lastProjectionFallback    bool
-	lastMaxWeightChange       float64
-	lastGradientNorm          float64
-	lastProjectedGradientNorm float64
-	lastBarrierHessianNorm    float64
-	lastQuadraticHessianNorm  float64
-	lastCombinedHessianNorm   float64
+	d                             int
+	n                             float64
+	beta                          float64
+	gamma                         float64
+	momentum                      float64
+	barrierDecay                  float64
+	barrierResetThreshold         float64
+	curvatureResetThreshold       float64
+	quadraticDecay                float64
+	quadraticUpdateScale          float64
+	epsilon                       float64
+	w                             []float64
+	p                             []float64
+	barrier                       *BarrierState
+	quadHess                      *mat.Dense
+	quadOffset                    []float64
+	last                          []float64
+	pending                       []float64
+	lastNewtonDecrement           float64
+	lastKKTResidual               float64
+	lastRelativeKKTResidual       float64
+	lastConstraintResidual        float64
+	lastHessianRegularization     float64
+	lastNewtonAccepted            bool
+	lastRawStepNorm               float64
+	lastAcceptedStepNorm          float64
+	lastStepSize                  float64
+	lastBacktrackingAttempts      int
+	lastObjectiveBefore           float64
+	lastObjectiveAfter            float64
+	lastBarrierObjective          float64
+	lastLinearLossObjective       float64
+	lastQuadraticObjective        float64
+	lastOffsetObjective           float64
+	lastTotalObjective            float64
+	lastProjectionFallback        bool
+	lastMaxWeightChange           float64
+	lastGradientNorm              float64
+	lastProjectedGradientNorm     float64
+	lastBarrierHessianNorm        float64
+	lastQuadraticHessianNorm      float64
+	lastCombinedHessianNorm       float64
+	lastQuadraticMemoryBeforeNorm float64
+	lastQuadraticUpdateNorm       float64
+	lastQuadraticMemoryAfterNorm  float64
+	lastQuadraticDecay            float64
+	lastCurvatureReset            bool
 }
 
 func NewMetaDONS(d, T int, eta float64) *MetaDONS {
@@ -223,6 +263,10 @@ func newBarrierState(d int) *BarrierState {
 }
 
 func NewDONS(d int, n, beta float64) *DONS {
+	return NewDONSWithConfig(d, n, beta, DefaultConfig())
+}
+
+func NewDONSWithConfig(d int, n, beta float64, config Config) *DONS {
 	w1 := make([]float64, d)
 	for i := range w1 {
 		w1[i] = 1.0 / float64(d)
@@ -230,24 +274,29 @@ func NewDONS(d int, n, beta float64) *DONS {
 
 	barrier := newBarrierState(d)
 	return &DONS{
-		d:          d,
-		n:          n,
-		beta:       beta,
-		gamma:      3.0,
-		momentum:   0.0,
-		epsilon:    1e-9,
-		w:          w1,
-		p:          append([]float64(nil), barrier.p...),
-		barrier:    barrier,
-		quadHess:   mat.NewDense(d, d, nil),
-		quadOffset: make([]float64, d),
+		d:                       d,
+		n:                       n,
+		beta:                    beta,
+		gamma:                   3.0,
+		momentum:                0.0,
+		barrierDecay:            config.BarrierDecay,
+		barrierResetThreshold:   config.BarrierResetThreshold,
+		curvatureResetThreshold: config.CurvatureResetThreshold,
+		quadraticDecay:          config.QuadraticDecay,
+		quadraticUpdateScale:    config.QuadraticUpdateScale,
+		epsilon:                 1e-9,
+		w:                       w1,
+		p:                       append([]float64(nil), barrier.p...),
+		barrier:                 barrier,
+		quadHess:                mat.NewDense(d, d, nil),
+		quadOffset:              make([]float64, d),
 	}
 }
 
 func (m *MetaDONS) newExpert(start, end int) *Expert {
 	localHorizon := maxInt(1, end-start)
 	priorLogWeight := -math.Log(float64(localHorizon))
-	dons := NewDONS(m.d, m.config.BarrierStrength, m.config.Beta)
+	dons := NewDONSWithConfig(m.d, m.config.BarrierStrength, m.config.Beta, m.config)
 	dons.gamma = m.gamma
 	dons.momentum = m.momentum
 	return &Expert{
@@ -450,15 +499,29 @@ func barrierHessian(u, nt []float64) [][]float64 {
 }
 
 func addQuadraticTerm(dons *DONS, g, w []float64) {
+	dons.lastQuadraticMemoryBeforeNorm = matrixInfinityNorm(dons.quadHess)
+	dons.lastQuadraticDecay = dons.quadraticDecay
+	if dons.quadraticDecay != 1 {
+		for i := 0; i < dons.d; i++ {
+			for j := 0; j < dons.d; j++ {
+				dons.quadHess.Set(i, j, dons.quadHess.At(i, j)*dons.quadraticDecay)
+			}
+			dons.quadOffset[i] *= dons.quadraticDecay
+		}
+	}
+	update := mat.NewDense(dons.d, dons.d, nil)
 	for i := 0; i < dons.d; i++ {
 		anchor := 0.0
 		for j := 0; j < dons.d; j++ {
-			coefficient := (dons.beta / 4.0) * g[i] * g[j]
+			coefficient := (dons.beta * dons.quadraticUpdateScale / 4.0) * g[i] * g[j]
 			dons.quadHess.Set(i, j, dons.quadHess.At(i, j)+coefficient)
+			update.Set(i, j, coefficient)
 			anchor += coefficient * w[j]
 		}
 		dons.quadOffset[i] -= anchor
 	}
+	dons.lastQuadraticUpdateNorm = matrixInfinityNorm(update)
+	dons.lastQuadraticMemoryAfterNorm = matrixInfinityNorm(dons.quadHess)
 }
 
 func (m *MetaDONS) Predict(t int) []float64 {
@@ -786,19 +849,34 @@ func (d *DONS) stabilizedQuadraticHessian() (*mat.Dense, float64) {
 	return q, regularization
 }
 
-func quadraticObjective(w, nt []float64, q *mat.Dense, offset, linear []float64) float64 {
-	value := 0.0
+type ObjectiveComponents struct {
+	Barrier    float64
+	LinearLoss float64
+	Quadratic  float64
+	Offset     float64
+	Total      float64
+}
+
+func objectiveComponents(w, nt []float64, q *mat.Dense, offset, linear []float64) ObjectiveComponents {
+	components := ObjectiveComponents{}
 	for i := range w {
 		if w[i] <= 0 || !isFinite(w[i]) {
-			return math.Inf(1)
+			components.Total = math.Inf(1)
+			return components
 		}
-		value -= nt[i] * math.Log(w[i])
-		value += (offset[i] + linear[i]) * w[i]
+		components.Barrier -= nt[i] * math.Log(w[i])
+		components.LinearLoss += linear[i] * w[i]
+		components.Offset += offset[i] * w[i]
 		for j := range w {
-			value += 0.5 * w[i] * q.At(i, j) * w[j]
+			components.Quadratic += 0.5 * w[i] * q.At(i, j) * w[j]
 		}
 	}
-	return value
+	components.Total = components.Barrier + components.LinearLoss + components.Quadratic + components.Offset
+	return components
+}
+
+func quadraticObjective(w, nt []float64, q *mat.Dense, offset, linear []float64) float64 {
+	return objectiveComponents(w, nt, q, offset, linear).Total
 }
 
 func maxInteriorStep(w, delta []float64, epsilon float64) float64 {
@@ -815,6 +893,18 @@ func maxInteriorStep(w, delta []float64, epsilon float64) float64 {
 }
 
 func (d *DONS) Update(r []float64, T int) {
+	d.lastCurvatureReset = false
+	if d.barrier != nil && len(d.p) > 0 {
+		barrierScale := 0.0
+		for i := range d.p {
+			barrierScale = math.Max(barrierScale, math.Abs(d.p[i]))
+		}
+		if barrierScale > d.barrierResetThreshold && d.lastCombinedHessianNorm > 0 && d.lastCombinedHessianNorm > d.curvatureResetThreshold {
+			d.quadHess = mat.NewDense(d.d, d.d, nil)
+			d.quadOffset = make([]float64, d.d)
+			d.lastCurvatureReset = true
+		}
+	}
 	d.lastNewtonDecrement = 0
 	d.lastKKTResidual = math.Inf(1)
 	d.lastRelativeKKTResidual = math.Inf(1)
@@ -827,6 +917,11 @@ func (d *DONS) Update(r []float64, T int) {
 	d.lastBacktrackingAttempts = 0
 	d.lastObjectiveBefore = math.Inf(1)
 	d.lastObjectiveAfter = math.Inf(1)
+	d.lastBarrierObjective = math.NaN()
+	d.lastLinearLossObjective = math.NaN()
+	d.lastQuadraticObjective = math.NaN()
+	d.lastOffsetObjective = math.NaN()
+	d.lastTotalObjective = math.NaN()
 	d.lastProjectionFallback = false
 	d.lastMaxWeightChange = 0
 	d.lastGradientNorm = 0
@@ -834,6 +929,10 @@ func (d *DONS) Update(r []float64, T int) {
 	d.lastBarrierHessianNorm = 0
 	d.lastQuadraticHessianNorm = 0
 	d.lastCombinedHessianNorm = 0
+	d.lastQuadraticMemoryBeforeNorm = 0
+	d.lastQuadraticUpdateNorm = 0
+	d.lastQuadraticMemoryAfterNorm = 0
+	d.lastQuadraticDecay = d.quadraticDecay
 
 	u := d.pending
 	if u == nil {
@@ -881,6 +980,19 @@ func (d *DONS) Update(r []float64, T int) {
 	d.lastBarrierHessianNorm = diagonalHessianNorm(barrierH)
 	d.lastQuadraticHessianNorm = matrixInfinityNorm(q)
 	d.lastCombinedHessianNorm = matrixInfinityNorm(H)
+	if d.lastCombinedHessianNorm > d.curvatureResetThreshold {
+		d.quadHess = mat.NewDense(d.d, d.d, nil)
+		d.quadOffset = make([]float64, d.d)
+		d.lastCurvatureReset = true
+		q, _ = d.stabilizedQuadraticHessian()
+		H = mat.NewDense(d.d, d.d, nil)
+		for i := 0; i < d.d; i++ {
+			for j := 0; j < d.d; j++ {
+				H.Set(i, j, barrierH[i][j]+q.At(i, j))
+			}
+		}
+		d.lastCombinedHessianNorm = matrixInfinityNorm(H)
+	}
 
 	result, err := solveConstrainedNewtonDetailed(H, grad)
 	for attempt := 0; err != nil && attempt < 3; attempt++ {
@@ -910,8 +1022,13 @@ func (d *DONS) Update(r []float64, T int) {
 	step := math.Min(rawStep, maxInteriorStep(d.w, result.delta, d.epsilon))
 	d.lastRawStepNorm = rawStep * vectorNorm(result.delta)
 	d.lastStepSize = step
-	oldObjective := quadraticObjective(d.w, nt, q, d.quadOffset, g)
-	d.lastObjectiveBefore = oldObjective
+	objectiveBefore := objectiveComponents(d.w, nt, q, d.quadOffset, g)
+	d.lastObjectiveBefore = objectiveBefore.Total
+	d.lastBarrierObjective = objectiveBefore.Barrier
+	d.lastLinearLossObjective = objectiveBefore.LinearLoss
+	d.lastQuadraticObjective = objectiveBefore.Quadratic
+	d.lastOffsetObjective = objectiveBefore.Offset
+	d.lastTotalObjective = objectiveBefore.Total
 	for attempt := 0; attempt < 12; attempt++ {
 		candidate := make([]float64, d.d)
 		for i := range candidate {
@@ -922,8 +1039,8 @@ func (d *DONS) Update(r []float64, T int) {
 			next = projectInterior(candidate, d.epsilon)
 			d.lastProjectionFallback = true
 		}
-		newObjective := quadraticObjective(next, nt, q, d.quadOffset, g)
-		if isFinite(newObjective) && newObjective <= oldObjective+1e-12*(1+math.Abs(oldObjective)) {
+		newObjective := objectiveComponents(next, nt, q, d.quadOffset, g)
+		if isFinite(newObjective.Total) && newObjective.Total <= objectiveBefore.Total+1e-12*(1+math.Abs(objectiveBefore.Total)) {
 			previousWeights := append([]float64(nil), d.w...)
 			d.w = next
 			d.lastNewtonAccepted = true
@@ -933,7 +1050,12 @@ func (d *DONS) Update(r []float64, T int) {
 			}
 			d.lastAcceptedStepNorm = vectorNorm(stepDifference)
 			d.lastBacktrackingAttempts = attempt
-			d.lastObjectiveAfter = newObjective
+			d.lastObjectiveAfter = newObjective.Total
+			d.lastBarrierObjective = newObjective.Barrier
+			d.lastLinearLossObjective = newObjective.LinearLoss
+			d.lastQuadraticObjective = newObjective.Quadratic
+			d.lastOffsetObjective = newObjective.Offset
+			d.lastTotalObjective = newObjective.Total
 			d.lastMaxWeightChange = maxWeightChange(previousWeights, next)
 			return
 		}
@@ -978,6 +1100,19 @@ func (d *DONS) updateP(u []float64) {
 	// Paper notation: update p_t,i only when 2p_t,i < u_t,i, preserving the barrier's
 	// adaptive recursion while keeping the iterates strictly interior.
 	d.barrier.update(u)
+	if d.barrierDecay > 0 && d.barrierDecay < 1 {
+		for i := range d.barrier.p {
+			d.barrier.p[i] *= d.barrierDecay
+		}
+	}
+	if d.barrierResetThreshold > 0 {
+		base := 1.0 / float64(len(d.barrier.p))
+		for i := range d.barrier.p {
+			if d.barrier.p[i] < math.Max(d.barrierResetThreshold, base*1e-3) {
+				d.barrier.p[i] = math.Max(d.barrierResetThreshold, base*1e-3)
+			}
+		}
+	}
 	d.p = append([]float64(nil), d.barrier.p...)
 }
 
@@ -1275,7 +1410,7 @@ func runTestDetailed(
 	weightRecords = append(weightRecords, header)
 
 	trades := [][]string{{"t", "date", "ticker", "entry", "exit", "weight"}}
-	diagnostics := [][]string{{"t", "date", "turnover", "active_experts", "retired_experts", "invalid_expert_updates", "max_newton_decrement", "max_relative_kkt_residual", "max_constraint_residual", "max_hessian_regularization", "accepted_newton_steps", "max_raw_step_norm", "max_accepted_step_norm", "max_step_size", "max_backtracking_attempts", "min_objective_before", "max_objective_after", "max_weight_change", "projection_fallbacks", "max_gradient_norm", "max_projected_gradient_norm", "max_barrier_hessian_norm", "max_quadratic_hessian_norm", "max_combined_hessian_norm"}}
+	diagnostics := [][]string{{"t", "date", "turnover", "active_experts", "retired_experts", "invalid_expert_updates", "max_newton_decrement", "max_relative_kkt_residual", "max_constraint_residual", "max_hessian_regularization", "accepted_newton_steps", "max_raw_step_norm", "max_accepted_step_norm", "max_step_size", "mean_step_size", "max_backtracking_attempts", "min_objective_before", "max_objective_after", "mean_objective_before", "max_weight_change", "mean_weight_change", "sum_abs_weight_change", "projection_fallbacks", "max_gradient_norm", "mean_gradient_norm", "max_projected_gradient_norm", "mean_projected_gradient_norm", "max_barrier_hessian_norm", "max_quadratic_hessian_norm", "max_combined_hessian_norm", "max_quadratic_memory_before_norm", "max_quadratic_update_norm", "max_quadratic_memory_after_norm", "quadratic_decay", "quadratic_update_scale", "max_barrier_objective", "mean_barrier_objective", "max_linear_loss_objective", "mean_linear_loss_objective", "max_quadratic_objective", "mean_quadratic_objective", "max_offset_objective", "mean_offset_objective", "max_total_objective", "mean_total_objective", "curvature_resets"}}
 
 	pricesByDate := priceLookup(allPrices)
 	prevPrices := make(map[string]float64, d)
@@ -1293,9 +1428,15 @@ func runTestDetailed(
 
 		// Select the portfolio before observing today's return.
 		w = meta.Predict(iter)
+		// Top-k is an execution overlay. Keep the dense learner portfolio in w,
+		// but record and trade the sparse, renormalized portfolio.
+		executed := w
+		if config.TopK > 0 {
+			executed = topK(w, config.TopK)
+		}
 		row := []string{fmt.Sprintf("%d", wealthIndex), datesTest[t].Format("2006-01-02")}
-		for _, weight := range w {
-			row = append(row, fmt.Sprintf("%.6f", weight))
+		for _, weight := range executed {
+			row = append(row, fmt.Sprintf("%.15g", weight))
 		}
 		weightRecords = append(weightRecords, row)
 		tickersOut := []string{}
@@ -1303,7 +1444,7 @@ func runTestDetailed(
 		exitsOut := []string{}
 		weightsOut := []string{}
 		for j := 0; j < d; j++ {
-			if w[j] <= 1e-12 {
+			if executed[j] <= 1e-12 {
 				continue
 			}
 			currPrice, ok := pricesByDate[tickers[j]][datesTest[t]]
@@ -1317,7 +1458,7 @@ func runTestDetailed(
 			}
 			entriesOut = append(entriesOut, fmt.Sprintf("%.4f", entryPrice))
 			exitsOut = append(exitsOut, fmt.Sprintf("%.4f", currPrice))
-			weightsOut = append(weightsOut, fmt.Sprintf("%.6f", w[j]))
+			weightsOut = append(weightsOut, fmt.Sprintf("%.15g", executed[j]))
 			prevPrices[tickers[j]] = currPrice
 		}
 		trades = append(trades, []string{
@@ -1329,10 +1470,6 @@ func runTestDetailed(
 			strings.Join(weightsOut, " "),
 		})
 		// DAILY COMPOUNDING. Zero means execute the dense learner output.
-		executed := w
-		if config.TopK > 0 {
-			executed = topK(w, config.TopK)
-		}
 		turnover := 0.5 * l1Distance(executed, previousExecuted)
 		retDense := dotSafe(rToday, w)
 		retAlgo := dotSafe(rToday, executed)
@@ -1341,6 +1478,7 @@ func runTestDetailed(
 
 		retSPY := dotSafe(rToday, uSPY)
 		retBest := dotSafe(rToday, uBest)
+		diagnosticExperts := meta.activeExperts(t)
 		meta.Update(rToday, iter)
 		iter++
 		// guard
@@ -1387,18 +1525,40 @@ func runTestDetailed(
 		maxRawStepNorm := 0.0
 		maxAcceptedStepNorm := 0.0
 		maxStepSize := 0.0
+		meanStepSize := 0.0
 		maxBacktracking := 0
 		minObjectiveBefore := math.Inf(1)
 		maxObjectiveAfter := math.Inf(-1)
+		meanObjectiveBefore := 0.0
 		maxWeightChangeValue := 0.0
+		meanWeightChangeValue := 0.0
+		sumAbsWeightChange := 0.0
 		projectionFallbacks := 0
 		maxGradientNorm := 0.0
+		meanGradientNorm := 0.0
 		maxProjectedGradientNorm := 0.0
+		meanProjectedGradientNorm := 0.0
 		maxBarrierHessianNorm := 0.0
 		maxQuadraticHessianNorm := 0.0
 		maxCombinedHessianNorm := 0.0
-		activeExperts := meta.activeExperts(iter)
-		for _, expert := range activeExperts {
+		maxQuadraticMemoryBeforeNorm := 0.0
+		maxQuadraticUpdateNorm := 0.0
+		maxQuadraticMemoryAfterNorm := 0.0
+		quadraticDecay := 0.0
+		quadraticUpdateScale := 0.0
+		maxBarrierObjective := math.Inf(-1)
+		meanBarrierObjective := 0.0
+		maxLinearLossObjective := math.Inf(-1)
+		meanLinearLossObjective := 0.0
+		maxQuadraticObjective := math.Inf(-1)
+		meanQuadraticObjective := 0.0
+		maxOffsetObjective := math.Inf(-1)
+		meanOffsetObjective := 0.0
+		maxTotalObjective := math.Inf(-1)
+		meanTotalObjectiveValue := 0.0
+		nActive := 0
+		for _, expert := range diagnosticExperts {
+			nActive++
 			maxDecrement = math.Max(maxDecrement, expert.dons.lastNewtonDecrement)
 			maxRelativeKKT = math.Max(maxRelativeKKT, expert.dons.lastRelativeKKTResidual)
 			maxConstraint = math.Max(maxConstraint, expert.dons.lastConstraintResidual)
@@ -1409,19 +1569,63 @@ func runTestDetailed(
 			maxRawStepNorm = math.Max(maxRawStepNorm, expert.dons.lastRawStepNorm)
 			maxAcceptedStepNorm = math.Max(maxAcceptedStepNorm, expert.dons.lastAcceptedStepNorm)
 			maxStepSize = math.Max(maxStepSize, expert.dons.lastStepSize)
+			meanStepSize += expert.dons.lastStepSize
 			maxBacktracking = maxInt(maxBacktracking, expert.dons.lastBacktrackingAttempts)
 			minObjectiveBefore = math.Min(minObjectiveBefore, expert.dons.lastObjectiveBefore)
 			maxObjectiveAfter = math.Max(maxObjectiveAfter, expert.dons.lastObjectiveAfter)
+			meanObjectiveBefore += expert.dons.lastObjectiveBefore
 			maxWeightChangeValue = math.Max(maxWeightChangeValue, expert.dons.lastMaxWeightChange)
+			meanWeightChangeValue += expert.dons.lastMaxWeightChange
+			sumAbsWeightChange += expert.dons.lastAcceptedStepNorm
 			if expert.dons.lastProjectionFallback {
 				projectionFallbacks++
 			}
 			maxGradientNorm = math.Max(maxGradientNorm, expert.dons.lastGradientNorm)
+			meanGradientNorm += expert.dons.lastGradientNorm
 			maxProjectedGradientNorm = math.Max(maxProjectedGradientNorm, expert.dons.lastProjectedGradientNorm)
+			meanProjectedGradientNorm += expert.dons.lastProjectedGradientNorm
 			maxBarrierHessianNorm = math.Max(maxBarrierHessianNorm, expert.dons.lastBarrierHessianNorm)
 			maxQuadraticHessianNorm = math.Max(maxQuadraticHessianNorm, expert.dons.lastQuadraticHessianNorm)
 			maxCombinedHessianNorm = math.Max(maxCombinedHessianNorm, expert.dons.lastCombinedHessianNorm)
+			maxQuadraticMemoryBeforeNorm = math.Max(maxQuadraticMemoryBeforeNorm, expert.dons.lastQuadraticMemoryBeforeNorm)
+			maxQuadraticUpdateNorm = math.Max(maxQuadraticUpdateNorm, expert.dons.lastQuadraticUpdateNorm)
+			maxQuadraticMemoryAfterNorm = math.Max(maxQuadraticMemoryAfterNorm, expert.dons.lastQuadraticMemoryAfterNorm)
+			quadraticDecay = math.Max(quadraticDecay, expert.dons.lastQuadraticDecay)
+			quadraticUpdateScale = math.Max(quadraticUpdateScale, expert.dons.quadraticUpdateScale)
+			maxBarrierObjective = math.Max(maxBarrierObjective, expert.dons.lastBarrierObjective)
+			meanBarrierObjective += expert.dons.lastBarrierObjective
+			maxLinearLossObjective = math.Max(maxLinearLossObjective, expert.dons.lastLinearLossObjective)
+			meanLinearLossObjective += expert.dons.lastLinearLossObjective
+			maxQuadraticObjective = math.Max(maxQuadraticObjective, expert.dons.lastQuadraticObjective)
+			meanQuadraticObjective += expert.dons.lastQuadraticObjective
+			maxOffsetObjective = math.Max(maxOffsetObjective, expert.dons.lastOffsetObjective)
+			meanOffsetObjective += expert.dons.lastOffsetObjective
+			maxTotalObjective = math.Max(maxTotalObjective, expert.dons.lastTotalObjective)
+			meanTotalObjectiveValue += expert.dons.lastTotalObjective
 			invalidUpdates += expert.numericalFailures
+		}
+		if nActive > 0 {
+			meanStepSize = meanStepSize / float64(nActive)
+			meanObjectiveBefore = meanObjectiveBefore / float64(nActive)
+			meanWeightChangeValue = meanWeightChangeValue / float64(nActive)
+			meanGradientNorm = meanGradientNorm / float64(nActive)
+			meanProjectedGradientNorm = meanProjectedGradientNorm / float64(nActive)
+			meanBarrierObjective = meanBarrierObjective / float64(nActive)
+			meanLinearLossObjective = meanLinearLossObjective / float64(nActive)
+			meanQuadraticObjective = meanQuadraticObjective / float64(nActive)
+			meanOffsetObjective = meanOffsetObjective / float64(nActive)
+			meanTotalObjectiveValue = meanTotalObjectiveValue / float64(nActive)
+		} else {
+			meanStepSize = 0
+			meanObjectiveBefore = 0
+			meanWeightChangeValue = 0
+			meanGradientNorm = 0
+			meanProjectedGradientNorm = 0
+			meanBarrierObjective = 0
+			meanLinearLossObjective = 0
+			meanQuadraticObjective = 0
+			meanOffsetObjective = 0
+			meanTotalObjectiveValue = 0
 		}
 		if math.IsInf(minObjectiveBefore, 1) {
 			minObjectiveBefore = 0
@@ -1429,20 +1633,45 @@ func runTestDetailed(
 		if math.IsInf(maxObjectiveAfter, -1) {
 			maxObjectiveAfter = 0
 		}
+		if math.IsInf(maxBarrierObjective, 1) {
+			maxBarrierObjective = 0
+		}
+		if math.IsInf(maxLinearLossObjective, 1) {
+			maxLinearLossObjective = 0
+		}
+		if math.IsInf(maxQuadraticObjective, 1) {
+			maxQuadraticObjective = 0
+		}
+		if math.IsInf(maxOffsetObjective, 1) {
+			maxOffsetObjective = 0
+		}
+		if math.IsInf(maxTotalObjective, 1) {
+			maxTotalObjective = 0
+		}
+		resetCount := 0
+		for _, expert := range diagnosticExperts {
+			if expert.dons.lastCurvatureReset {
+				resetCount++
+			}
+		}
 		diagnostics = append(diagnostics, []string{
 			fmt.Sprintf("%d", wealthIndex), datesTest[t].Format("2006-01-02"),
-			fmt.Sprintf("%.6f", turnover), fmt.Sprintf("%d", len(activeExperts)),
+			fmt.Sprintf("%.6f", turnover), fmt.Sprintf("%d", len(diagnosticExperts)),
 			fmt.Sprintf("%d", meta.retired), fmt.Sprintf("%d", invalidUpdates),
 			fmt.Sprintf("%.6g", maxDecrement), fmt.Sprintf("%.6g", maxRelativeKKT),
 			fmt.Sprintf("%.6g", maxConstraint), fmt.Sprintf("%.6g", maxRegularization),
 			fmt.Sprintf("%d", acceptedSteps),
 			fmt.Sprintf("%.6g", maxRawStepNorm), fmt.Sprintf("%.6g", maxAcceptedStepNorm),
-			fmt.Sprintf("%.6g", maxStepSize), fmt.Sprintf("%d", maxBacktracking),
-			fmt.Sprintf("%.6g", minObjectiveBefore), fmt.Sprintf("%.6g", maxObjectiveAfter),
-			fmt.Sprintf("%.6g", maxWeightChangeValue), fmt.Sprintf("%d", projectionFallbacks),
-			fmt.Sprintf("%.6g", maxGradientNorm), fmt.Sprintf("%.6g", maxProjectedGradientNorm),
-			fmt.Sprintf("%.6g", maxBarrierHessianNorm), fmt.Sprintf("%.6g", maxQuadraticHessianNorm),
-			fmt.Sprintf("%.6g", maxCombinedHessianNorm),
+			fmt.Sprintf("%.6g", maxStepSize), fmt.Sprintf("%.6g", meanStepSize), fmt.Sprintf("%d", maxBacktracking),
+			fmt.Sprintf("%.6g", minObjectiveBefore), fmt.Sprintf("%.6g", maxObjectiveAfter), fmt.Sprintf("%.6g", meanObjectiveBefore),
+			fmt.Sprintf("%.6g", maxWeightChangeValue), fmt.Sprintf("%.6g", meanWeightChangeValue), fmt.Sprintf("%.6g", sumAbsWeightChange), fmt.Sprintf("%d", projectionFallbacks),
+			fmt.Sprintf("%.6g", maxGradientNorm), fmt.Sprintf("%.6g", meanGradientNorm), fmt.Sprintf("%.6g", maxProjectedGradientNorm), fmt.Sprintf("%.6g", meanProjectedGradientNorm),
+			fmt.Sprintf("%.6g", maxBarrierHessianNorm), fmt.Sprintf("%.6g", maxQuadraticHessianNorm), fmt.Sprintf("%.6g", maxCombinedHessianNorm),
+			fmt.Sprintf("%.6g", maxQuadraticMemoryBeforeNorm), fmt.Sprintf("%.6g", maxQuadraticUpdateNorm), fmt.Sprintf("%.6g", maxQuadraticMemoryAfterNorm), fmt.Sprintf("%.6g", quadraticDecay), fmt.Sprintf("%.6g", quadraticUpdateScale),
+			fmt.Sprintf("%.6g", maxBarrierObjective), fmt.Sprintf("%.6g", meanBarrierObjective), fmt.Sprintf("%.6g", maxLinearLossObjective), fmt.Sprintf("%.6g", meanLinearLossObjective),
+			fmt.Sprintf("%.6g", maxQuadraticObjective), fmt.Sprintf("%.6g", meanQuadraticObjective), fmt.Sprintf("%.6g", maxOffsetObjective), fmt.Sprintf("%.6g", meanOffsetObjective),
+			fmt.Sprintf("%.6g", maxTotalObjective), fmt.Sprintf("%.6g", meanTotalObjectiveValue),
+			fmt.Sprintf("%d", resetCount),
 		})
 
 	}
@@ -1564,13 +1793,25 @@ func maxDrawdown(wealth []float64) float64 {
 func main() {
 	config := DefaultConfig()
 	executionK := flag.Int("top-k", config.TopK, "execute only the top K assets; 0 keeps the dense portfolio")
+	barrierStrength := flag.Float64("barrier-strength", config.BarrierStrength, "barrier strength for the DONS log barrier")
 	gamma := flag.Float64("gamma", config.Gamma, "Newton damping multiplier")
 	momentum := flag.Float64("momentum", config.Momentum, "heuristic momentum overlay; 0 disables it")
+	barrierDecay := flag.Float64("barrier-decay", config.BarrierDecay, "optional multiplicative decay applied to the barrier state each update; 1 keeps it fixed")
+	barrierResetThreshold := flag.Float64("barrier-reset-threshold", config.BarrierResetThreshold, "minimum barrier floor before the adaptive barrier is reset")
+	curvatureResetThreshold := flag.Float64("curvature-reset-threshold", config.CurvatureResetThreshold, "reset quadratic curvature when the combined Hessian exceeds this scale")
+	quadraticDecay := flag.Float64("quadratic-decay", config.QuadraticDecay, "multiplicative decay applied to accumulated quadratic memory each update")
+	quadraticUpdateScale := flag.Float64("quadratic-update-scale", config.QuadraticUpdateScale, "scale applied to each new quadratic outer-product update")
 	transactionCost := flag.Float64("transaction-cost", config.TransactionCost, "proportional cost per unit turnover")
 	flag.Parse()
 	config.TopK = *executionK
+	config.BarrierStrength = *barrierStrength
 	config.Gamma = *gamma
 	config.Momentum = *momentum
+	config.BarrierDecay = *barrierDecay
+	config.BarrierResetThreshold = *barrierResetThreshold
+	config.CurvatureResetThreshold = *curvatureResetThreshold
+	config.QuadraticDecay = *quadraticDecay
+	config.QuadraticUpdateScale = *quadraticUpdateScale
 	config.TransactionCost = *transactionCost
 	if err := config.Validate(); err != nil {
 		log.Fatal(err)

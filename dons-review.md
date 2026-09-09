@@ -52,6 +52,29 @@ The current Go program is not a faithful implementation of the paper's Algorithm
 
 - **No public Python reference implementation was found.** GitHub searches for arXiv `2202.07574`, the paper title, and DONS portfolio code found no matching public Python implementation. The paper and its algorithms remain the authoritative reference.
 
+## Empirical Diagnostics: Quadratic Memory
+
+The latest real-data run used the current defaults: `barrier-strength = 0.25`, `curvature-reset-threshold = 1e5`, `quadratic-decay = 0.99`, and `quadratic-update-scale = 1.0`.
+
+- **Data quality was clean.** The test period was 2020-01-02 through 2026-09-09 with 1,680 observations. Forward-filled prices, invalid price pairs, non-finite returns, and invalid expert updates were all zero.
+
+- **Observed performance was above SPY.** DONS finished with wealth `3.170812` versus `2.603009` for SPY. The best-single-asset wealth was `38.550533`, but that is a hindsight oracle and is not an investable comparator.
+
+- **Quadratic decay reduced accumulated curvature.** Peak quadratic memory was approximately `1,401`, peak quadratic Hessian norm was `1,408`, and peak combined Hessian norm was `2,235`. No curvature resets occurred. The preceding no-decay run reached approximately `14,353` peak quadratic memory and `15,172` peak combined Hessian norm.
+
+- **Decay increased responsiveness.** Total turnover was `1.1645`, mean maximum weight change was `1.244e-4`, and peak maximum weight change was `6.786e-4`. The preceding no-decay run had turnover `0.7229` and mean maximum weight change `8.956e-5`. The additional movement should be evaluated after transaction costs before treating it as an improvement.
+
+- **The remaining allocation changes are still modest.** The decay policy fixes quadratic-memory accumulation, but it does not make the portfolio highly concentrated or rapidly rotating. The next question is whether this level of movement is economically useful after costs, not whether the Newton solver is numerically stuck.
+
+### Recommended Next Experiments
+
+1. Evaluate `quadratic-decay` values `0.97`, `0.99`, and `0.995` against update scales `0.25`, `0.5`, and `1.0`.
+2. Repeat that grid with proportional transaction costs such as `0.0005`, `0.001`, and `0.002`; select on net wealth and risk-adjusted return rather than raw wealth.
+3. Use chronological walk-forward validation instead of selecting settings on the same final test period.
+4. Add a normalized outer-product update, such as $g_tg_t^\top / \max(\|g_t\|^2, \epsilon)$, so curvature accumulation is less sensitive to return-gradient scale.
+5. Consider soft curvature control that scales down new updates when memory is large instead of relying only on a hard reset threshold.
+6. Compare against uniform, equal-weight buy-and-hold, SPY, and a simple rolling-momentum baseline; keep the hindsight best-single-asset series clearly labeled as an oracle.
+
 ## Implementation Plan
 
 The implementation should preserve top-$K$ selection, `gamma`, and momentum as explicit strategy overlays while correcting the DONS core. With these overlays enabled, the program can be a causal portfolio engine but cannot claim the paper's formal regret guarantee.
@@ -141,3 +164,18 @@ Prioritize the following remaining improvements:
 9. **Benchmark scaling.** Measure runtime and allocations as dimension, horizon, and active-expert count grow. Reuse matrices and reduce temporary slice allocation only after profiling.
 
 10. **Document approximation boundaries.** Keep the README and review explicit that the barrier recursion, sleeping-expert schedule, momentum, top-k execution, and practical Newton safeguards are approximations or strategy overlays rather than literal paper equations.
+
+## Top-K Execution Observation (2026-09-09)
+
+In the current backtest, `top-k 10` appears to produce the highest algorithm wealth among the tested execution settings. This is plausible because it removes many very small positions that dilute the strongest dense DONS/meta signals, while retaining more diversification than very small values such as `top-k 3`. The top-k overlay selects the ten largest dense weights, renormalizes those selected weights to sum to one, and sets all other executed weights to zero. It does not change the dense learner state.
+
+This is an observed result for the current evaluation period, not evidence that ten holdings is generally optimal. The setting may benefit from test-period selection bias, market-regime dependence, or a favorable tradeoff between concentration and turnover. It should also be compared on net wealth after transaction costs rather than gross wealth alone.
+
+### Suggestions for Improvement
+
+1. Run a fixed comparison grid using dense execution and `top-k` values such as `3`, `5`, `10`, `15`, and `20` on the identical return stream.
+2. Report gross wealth, net wealth after proportional transaction costs, turnover, annualized volatility, Sharpe ratio, maximum drawdown, and number of active holdings for each setting.
+3. Select top-k and other hyperparameters on a chronological validation period, then evaluate the chosen configuration on a later untouched test period.
+4. Repeat the comparison across multiple walk-forward windows and market regimes to determine whether the top-k 10 advantage persists.
+5. Check whether the result comes from concentration, reduced exposure to weak assets, or lower effective trading costs by comparing the selected weights with dense weights and their daily turnover.
+6. Keep dense learner wealth, sparse executed wealth, and transaction-cost-adjusted wealth in separate reports so the execution overlay is not mistaken for a change to the DONS core.
