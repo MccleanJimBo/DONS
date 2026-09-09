@@ -978,5 +978,15 @@ func main() {
 	if err := plotSeries("analysis/spy.png", spyWealth, "SPY"); err != nil {
 		fmt.Println("plotSeries error:", err)
 	}
+	regretSeries := make([]float64, len(algoWealth))
+	regret := 0.0
+	for i := range algoWealth {
+		regret += math.Log(spyWealth[i] / algoWealth[i])
+		regretSeries[i] = regret
+	}
+	if err := plotSeries("analysis/regret.png", regretSeries, "Regret sum(log(spy/algo))"); err != nil {
+		fmt.Println("regret plot error:", err)
+	}
+
 	fmt.Println("Backtest complete.")
 }
