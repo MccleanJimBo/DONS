@@ -60,7 +60,53 @@ Run with sparse top-3 execution:
 go run . -top-k 3
 ```
 
-You can also configure the learning parameters with flags if they are exposed in the CLI.
+Run with a higher Newton damping and transaction cost:
+
+```bash
+go run . -gamma 10 -transaction-cost 0.001
+```
+
+## Command-line arguments
+
+The program uses Go's standard `flag` package. The supported arguments are:
+
+- `-top-k` (default: `0`)
+  - execute only the top `K` assets; `0` keeps the dense portfolio as-is.
+
+- `-barrier-strength` (default: `0.25`)
+  - strength of the DONS log-barrier term used in the barrier-style Newton update.
+
+- `-gamma` (default: `3.0`)
+  - Newton damping multiplier. Higher values increase the step size scaling before backtracking.
+
+- `-momentum` (default: `0.0`)
+  - heuristic momentum overlay applied to the portfolio; `0` disables it. Values must stay in `[0, 1)`.
+
+- `-barrier-decay` (default: `1.0`)
+  - multiplicative decay applied to the barrier state each update; `1.0` keeps it fixed.
+
+- `-barrier-reset-threshold` (default: `1e-8`)
+  - lower floor for the barrier state before the adaptive barrier is reset.
+
+- `-curvature-reset-threshold` (default: `1e5`)
+  - reset quadratic curvature when the combined Hessian exceeds this scale.
+
+- `-quadratic-decay` (default: `0.99`)
+  - multiplicative decay applied to accumulated quadratic memory each update.
+
+- `-quadratic-update-scale` (default: `1.0`)
+  - scale applied to each new quadratic outer-product update.
+
+- `-transaction-cost` (default: `0.0`)
+  - proportional cost per unit turnover. A value of `0.001` means roughly 0.1% cost per turnover unit.
+
+Example with several overrides:
+
+```bash
+go run . -top-k 10 -gamma 5 -momentum 0.1 -barrier-strength 0.5 -transaction-cost 0.001
+```
+
+The configuration is validated at startup; invalid values such as non-positive barrier strength or negative costs will cause the program to exit with an error.
 
 ## Data flow
 
